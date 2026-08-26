@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# Cargar variables de entorno desde el archivo .env
+# Cargar variables de entorno
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -20,12 +20,12 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(
-    title="API Actividades",
-    description="Backend CRUD completo para administrar actividades en Supabase",
-    version="1.0.0"
+    title="API Actividades - Aquí Todos Ganan",
+    description="Backend CRUD integral para administrar actividades y sus tablas vinculadas",
+    version="1.4.0"
 )
 
-# Configurar CORS para permitir peticiones desde Ionic / Angular
+# Configurar CORS para Ionic / Angular
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,12 +34,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Consulta SQL reusable para obtener los datos anidados de tablas foráneas
+# Consulta SQL reusable con JOINs a tablas de catálogo y tablas secundarias
 QUERY_RELACIONES = """
     *,
     tipo_actividad(descripcion),
     estado_actividad(descripcion),
-    sede(descripcion)
+    sede(descripcion),
+    usuario(nombre_completo, correo),
+    puntaje_act(id_puntaje, cantidad, fecha_vencimiento),
+    cupo_actividad(id_cupo, cantidad),
+    lugar_actividad(id_lugar_actividad, descripcion),
+    requisito_participacion(id_requisito, descripcion),
+    calendario(id_calendario, fecha, hora, lugar)
 """
 
 # ==========================================
@@ -53,9 +59,15 @@ class ActividadCreate(BaseModel):
     fecha_inicio: datetime
     fecha_termino: datetime
     id_tipo_actividad: int
-    id_estado_actividad: int
+    id_estado_actividad: Optional[int] = 1  # Por defecto 1 (Programada)
     id_sede: int
     rut_usuario: str
+    
+    puntos: int
+    cupos: int
+    lugar: str
+    requisito: Optional[str] = None
+
 
 class ActividadUpdate(BaseModel):
     nombre_actividad: Optional[str] = None
@@ -67,6 +79,12 @@ class ActividadUpdate(BaseModel):
     id_estado_actividad: Optional[int] = None
     id_sede: Optional[int] = None
     rut_usuario: Optional[str] = None
+    
+    puntos: Optional[int] = None
+    cupos: Optional[int] = None
+    lugar: Optional[str] = None
+    requisito: Optional[str] = None
+
 
 # ==========================================
 # RUTAS DE LA API (CRUD ACTIVIDADES)
@@ -77,7 +95,20 @@ def inicio():
     return {"mensaje": "API de Actividades operativa y conectada a Supabase"}
 
 
-# 1. Obtener la lista completa de actividades
+@app.get("/docentes", tags=["Catálogos"])
+def obtener_docentes():
+    try:
+        res = (
+            supabase.table("usuario")
+            .select("rut_usuario, nombre_completo, correo, id_tipo_usuario")
+            .eq("id_tipo_usuario", 3)
+            .execute()
+        )
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/actividades", tags=["Actividades"])
 def obtener_actividades():
     try:
@@ -87,7 +118,6 @@ def obtener_actividades():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 2. Obtener una actividad específica por id
 @app.get("/actividades/{id_actividad}", tags=["Actividades"])
 def obtener_actividad_por_id(id_actividad: int):
     try:
@@ -95,67 +125,207 @@ def obtener_actividad_por_id(id_actividad: int):
         if not res.data:
             raise HTTPException(status_code=404, detail="La actividad no existe")
         return res.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 3. Crear una nueva actividad
 @app.post("/actividades", status_code=status.HTTP_201_CREATED, tags=["Actividades"])
 def crear_actividad(actividad: ActividadCreate):
     try:
         datos = actividad.model_dump()
+
+        # Forzar el estado 'Programada' (ID = 1)
+        datos["id_estado_actividad"] = 1
+
+        # Extraer campos de las tablas secundarias
+        puntos = datos.pop("puntos")
+        cupos = datos.pop("cupos")
+        lugar = datos.pop("lugar")
+        requisito = datos.pop("requisito", None)
+
+        # Formatear fechas y horas
+        fecha_cal = datos['fecha_inicio'].date().isoformat()
+        hora_cal = datos['fecha_inicio'].time().strftime("%H:%M:%S")
+
         datos['fecha_inicio'] = datos['fecha_inicio'].isoformat()
         datos['fecha_termino'] = datos['fecha_termino'].isoformat()
+        fecha_vencimiento_date = actividad.fecha_termino.date().isoformat()
 
-        # Insertar y retornar inmediatamente el registro con sus relaciones
-        res = supabase.table("actividad").insert(datos).execute()
-        if not res.data:
+        # 1. Insertar en 'actividad' (La BD genera automáticamente el id_actividad secuencial)
+        res_act = supabase.table("actividad").insert(datos).execute()
+        if not res_act.data:
             raise HTTPException(status_code=400, detail="Error al registrar la actividad")
-        
-        id_creado = res.data[0]["id_actividad"]
-        actividad_creada = supabase.table("actividad").select(QUERY_RELACIONES).eq("id_actividad", id_creado).execute()
+
+        id_actividad = res_act.data[0]["id_actividad"]
+
+        # 2. Insertar en 'puntaje_act'
+        supabase.table("puntaje_act").insert({
+            "cantidad": puntos,
+            "fecha_vencimiento": fecha_vencimiento_date,
+            "id_actividad": id_actividad
+        }).execute()
+
+        # 3. Insertar en 'cupo_actividad'
+        supabase.table("cupo_actividad").insert({
+            "cantidad": cupos,
+            "id_actividad": id_actividad
+        }).execute()
+
+        # 4. Insertar en 'lugar_actividad'
+        supabase.table("lugar_actividad").insert({
+            "descripcion": lugar,
+            "id_actividad": id_actividad
+        }).execute()
+
+        # 5. Insertar en 'calendario'
+        supabase.table("calendario").insert({
+            "fecha": fecha_cal,
+            "hora": hora_cal,
+            "lugar": lugar,
+            "id_actividad": id_actividad
+        }).execute()
+
+        # 6. Insertar en 'requisito_participacion' si aplica
+        if requisito:
+            supabase.table("requisito_participacion").insert({
+                "descripcion": requisito,
+                "id_actividad": id_actividad
+            }).execute()
+
+        actividad_creada = supabase.table("actividad").select(QUERY_RELACIONES).eq("id_actividad", id_actividad).execute()
         return actividad_creada.data[0]
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 4. Actualizar una actividad existente
 @app.put("/actividades/{id_actividad}", tags=["Actividades"])
 def actualizar_actividad(id_actividad: int, actividad: ActividadUpdate):
     try:
-        datos = actividad.model_dump(exclude_unset=True)
-        if not datos:
-            raise HTTPException(status_code=400, detail="Sin campos para actualizar")
-
-        if 'fecha_inicio' in datos and datos['fecha_inicio']:
-            datos['fecha_inicio'] = datos['fecha_inicio'].isoformat()
-        if 'fecha_termino' in datos and datos['fecha_termino']:
-            datos['fecha_termino'] = datos['fecha_termino'].isoformat()
-
-        res = supabase.table("actividad").update(datos).eq("id_actividad", id_actividad).execute()
-        if not res.data:
+        check = supabase.table("actividad").select("id_actividad").eq("id_actividad", id_actividad).execute()
+        if not check.data:
             raise HTTPException(status_code=404, detail="Actividad no encontrada")
 
-        actividad_actualizada = supabase.table("actividad").select(QUERY_RELACIONES).eq("id_actividad", id_actividad).execute()
-        return actividad_actualizada.data[0]
+        datos = actividad.model_dump(exclude_unset=True)
+
+        puntos = datos.pop('puntos', None)
+        cupos = datos.pop('cupos', None)
+        lugar = datos.pop('lugar', None)
+        requisito = datos.pop('requisito', None)
+
+        dt_inicio_obj = datos.get('fecha_inicio')
+
+        if datos:
+            if 'fecha_inicio' in datos and datos['fecha_inicio']:
+                datos['fecha_inicio'] = datos['fecha_inicio'].isoformat()
+            if 'fecha_termino' in datos and datos['fecha_termino']:
+                datos['fecha_termino'] = datos['fecha_termino'].isoformat()
+
+            supabase.table("actividad").update(datos).eq("id_actividad", id_actividad).execute()
+
+        if puntos is not None:
+            p_res = supabase.table("puntaje_act").select("id_puntaje").eq("id_actividad", id_actividad).execute()
+            if p_res.data:
+                supabase.table("puntaje_act").update({"cantidad": puntos}).eq("id_actividad", id_actividad).execute()
+            else:
+                fecha_venc = datos.get('fecha_termino') or datetime.now().isoformat()
+                supabase.table("puntaje_act").insert({
+                    "cantidad": puntos,
+                    "fecha_vencimiento": fecha_venc[:10] if isinstance(fecha_venc, str) else fecha_venc.date().isoformat(),
+                    "id_actividad": id_actividad
+                }).execute()
+
+        if cupos is not None:
+            c_res = supabase.table("cupo_actividad").select("id_cupo").eq("id_actividad", id_actividad).execute()
+            if c_res.data:
+                supabase.table("cupo_actividad").update({"cantidad": cupos}).eq("id_actividad", id_actividad).execute()
+            else:
+                supabase.table("cupo_actividad").insert({
+                    "cantidad": cupos,
+                    "id_actividad": id_actividad
+                }).execute()
+
+        if lugar is not None:
+            l_res = supabase.table("lugar_actividad").select("id_lugar_actividad").eq("id_actividad", id_actividad).execute()
+            if l_res.data:
+                supabase.table("lugar_actividad").update({"descripcion": lugar}).eq("id_actividad", id_actividad).execute()
+            else:
+                supabase.table("lugar_actividad").insert({
+                    "descripcion": lugar,
+                    "id_actividad": id_actividad
+                }).execute()
+
+        if lugar is not None or dt_inicio_obj is not None:
+            cal_res = supabase.table("calendario").select("id_calendario").eq("id_actividad", id_actividad).execute()
+            
+            cal_payload = {}
+            if lugar is not None:
+                cal_payload["lugar"] = lugar
+            if dt_inicio_obj is not None:
+                cal_payload["fecha"] = dt_inicio_obj.date().isoformat()
+                cal_payload["hora"] = dt_inicio_obj.time().strftime("%H:%M:%S")
+
+            if cal_res.data:
+                supabase.table("calendario").update(cal_payload).eq("id_actividad", id_actividad).execute()
+            else:
+                cal_payload["id_actividad"] = id_actividad
+                if "lugar" not in cal_payload:
+                    cal_payload["lugar"] = lugar or "Por definir"
+                if "fecha" not in cal_payload:
+                    act_data = supabase.table("actividad").select("fecha_inicio").eq("id_actividad", id_actividad).execute()
+                    dt = datetime.fromisoformat(act_data.data[0]["fecha_inicio"].replace('Z', '+00:00'))
+                    cal_payload["fecha"] = dt.date().isoformat()
+                    cal_payload["hora"] = dt.time().strftime("%H:%M:%S")
+                supabase.table("calendario").insert(cal_payload).execute()
+
+        if requisito is not None:
+            r_res = supabase.table("requisito_participacion").select("id_requisito").eq("id_actividad", id_actividad).execute()
+            if r_res.data:
+                supabase.table("requisito_participacion").update({"descripcion": requisito}).eq("id_actividad", id_actividad).execute()
+            else:
+                supabase.table("requisito_participacion").insert({
+                    "descripcion": requisito,
+                    "id_actividad": id_actividad
+                }).execute()
+
+        res = supabase.table("actividad").select(QUERY_RELACIONES).eq("id_actividad", id_actividad).execute()
+        return res.data[0]
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 5. Eliminar una actividad
 @app.delete("/actividades/{id_actividad}", tags=["Actividades"])
 def eliminar_actividad(id_actividad: int):
     try:
-        res = supabase.table("actividad").delete().eq("id_actividad", id_actividad).execute()
-        if not res.data:
+        check = supabase.table("actividad").select("id_actividad").eq("id_actividad", id_actividad).execute()
+        if not check.data:
             raise HTTPException(status_code=404, detail="Actividad no encontrada para eliminar")
-        return {"mensaje": f"Actividad {id_actividad} eliminada correctamente"}
+
+        supabase.table("puntaje_act").delete().eq("id_actividad", id_actividad).execute()
+        supabase.table("cupo_actividad").delete().eq("id_actividad", id_actividad).execute()
+        supabase.table("lugar_actividad").delete().eq("id_actividad", id_actividad).execute()
+        supabase.table("requisito_participacion").delete().eq("id_actividad", id_actividad).execute()
+        supabase.table("calendario").delete().eq("id_actividad", id_actividad).execute()
+
+        supabase.table("actividad").delete().eq("id_actividad", id_actividad).execute()
+
+        return {"mensaje": f"Actividad {id_actividad} y todos sus registros asociados fueron eliminados correctamente"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# ENDPOINTS AUXILIARES (Para Selects en Frontend)
+# ENDPOINTS AUXILIARES
 # ==========================================
 
 @app.get("/tipos-actividad", tags=["Catálogos"])
