@@ -1,7 +1,8 @@
 import os
+import uuid
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -21,8 +22,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(
     title="API Actividades - Aquí Todos Ganan",
-    description="Backend CRUD integral para administrar actividades y sus tablas vinculadas",
-    version="1.4.0"
+    description="Backend CRUD integral para administrar actividades, almacenamiento de imágenes y tablas vinculadas",
+    version="1.6.0"
 )
 
 # Configurar CORS para Ionic / Angular
@@ -49,6 +50,23 @@ QUERY_RELACIONES = """
 """
 
 # ==========================================
+# FUNCIONES AUXILIARES
+# ==========================================
+
+def eliminar_imagen_storage(url_imagen: Optional[str]):
+    """Extrae el nombre del archivo desde la URL pública y lo borra del bucket 'actividad'."""
+    if not url_imagen:
+        return
+    try:
+        # Extraer el nombre final del archivo de la URL
+        nombre_archivo = url_imagen.split("/")[-1]
+        if nombre_archivo:
+            supabase.storage.from_("actividad").remove([nombre_archivo])
+    except Exception as e:
+        print(f"Advertencia: No se pudo eliminar la imagen del storage ({url_imagen}): {e}")
+
+
+# ==========================================
 # MODELOS PYDANTIC
 # ==========================================
 
@@ -62,6 +80,7 @@ class ActividadCreate(BaseModel):
     id_estado_actividad: Optional[int] = 1  # Por defecto 1 (Programada)
     id_sede: int
     rut_usuario: str
+    img_actv: Optional[str] = None  # <-- Campo de imagen (URL o String)
     
     puntos: int
     cupos: int
@@ -79,6 +98,7 @@ class ActividadUpdate(BaseModel):
     id_estado_actividad: Optional[int] = None
     id_sede: Optional[int] = None
     rut_usuario: Optional[str] = None
+    img_actv: Optional[str] = None  # <-- Campo de imagen (URL o String)
     
     puntos: Optional[int] = None
     cupos: Optional[int] = None
@@ -93,6 +113,32 @@ class ActividadUpdate(BaseModel):
 @app.get("/", tags=["Inicio"])
 def inicio():
     return {"mensaje": "API de Actividades operativa y conectada a Supabase"}
+
+
+@app.post("/upload-imagen", tags=["Archivos"])
+async def subir_imagen(file: UploadFile = File(...)):
+    """Subes una imagen al bucket 'actividad' y retorna su URL pública."""
+    try:
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="El archivo enviado no es una imagen válida.")
+
+        file_ext = file.filename.split(".")[-1]
+        file_name = f"{uuid.uuid4()}.{file_ext}"
+
+        contents = await file.read()
+
+        supabase.storage.from_("actividad").upload(
+            file_name,
+            contents,
+            file_options={"content-type": file.content_type}
+        )
+
+        url_publica = supabase.storage.from_("actividad").get_public_url(file_name)
+
+        return {"url": url_publica, "filename": file_name}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al subir imagen: {str(e)}")
 
 
 @app.get("/docentes", tags=["Catálogos"])
@@ -136,16 +182,14 @@ def crear_actividad(actividad: ActividadCreate):
     try:
         datos = actividad.model_dump()
 
-        # Forzar el estado 'Programada' (ID = 1)
-        datos["id_estado_actividad"] = 1
+        if not datos.get("id_estado_actividad"):
+            datos["id_estado_actividad"] = 1
 
-        # Extraer campos de las tablas secundarias
         puntos = datos.pop("puntos")
         cupos = datos.pop("cupos")
         lugar = datos.pop("lugar")
         requisito = datos.pop("requisito", None)
 
-        # Formatear fechas y horas
         fecha_cal = datos['fecha_inicio'].date().isoformat()
         hora_cal = datos['fecha_inicio'].time().strftime("%H:%M:%S")
 
@@ -153,33 +197,28 @@ def crear_actividad(actividad: ActividadCreate):
         datos['fecha_termino'] = datos['fecha_termino'].isoformat()
         fecha_vencimiento_date = actividad.fecha_termino.date().isoformat()
 
-        # 1. Insertar en 'actividad' (La BD genera automáticamente el id_actividad secuencial)
         res_act = supabase.table("actividad").insert(datos).execute()
         if not res_act.data:
             raise HTTPException(status_code=400, detail="Error al registrar la actividad")
 
         id_actividad = res_act.data[0]["id_actividad"]
 
-        # 2. Insertar en 'puntaje_act'
         supabase.table("puntaje_act").insert({
             "cantidad": puntos,
             "fecha_vencimiento": fecha_vencimiento_date,
             "id_actividad": id_actividad
         }).execute()
 
-        # 3. Insertar en 'cupo_actividad'
         supabase.table("cupo_actividad").insert({
             "cantidad": cupos,
             "id_actividad": id_actividad
         }).execute()
 
-        # 4. Insertar en 'lugar_actividad'
         supabase.table("lugar_actividad").insert({
             "descripcion": lugar,
             "id_actividad": id_actividad
         }).execute()
 
-        # 5. Insertar en 'calendario'
         supabase.table("calendario").insert({
             "fecha": fecha_cal,
             "hora": hora_cal,
@@ -187,7 +226,6 @@ def crear_actividad(actividad: ActividadCreate):
             "id_actividad": id_actividad
         }).execute()
 
-        # 6. Insertar en 'requisito_participacion' si aplica
         if requisito:
             supabase.table("requisito_participacion").insert({
                 "descripcion": requisito,
@@ -206,11 +244,18 @@ def crear_actividad(actividad: ActividadCreate):
 @app.put("/actividades/{id_actividad}", tags=["Actividades"])
 def actualizar_actividad(id_actividad: int, actividad: ActividadUpdate):
     try:
-        check = supabase.table("actividad").select("id_actividad").eq("id_actividad", id_actividad).execute()
+        # 1. Obtener la imagen actual guardada en la BD
+        check = supabase.table("actividad").select("id_actividad, img_actv").eq("id_actividad", id_actividad).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="Actividad no encontrada")
 
+        img_antigua = check.data[0].get("img_actv")
         datos = actividad.model_dump(exclude_unset=True)
+
+        # 2. Si viene una nueva imagen y es distinta a la anterior, eliminar la previa del Storage
+        nueva_img = datos.get("img_actv")
+        if nueva_img and img_antigua and nueva_img != img_antigua:
+            eliminar_imagen_storage(img_antigua)
 
         puntos = datos.pop('puntos', None)
         cupos = datos.pop('cupos', None)
@@ -304,19 +349,28 @@ def actualizar_actividad(id_actividad: int, actividad: ActividadUpdate):
 @app.delete("/actividades/{id_actividad}", tags=["Actividades"])
 def eliminar_actividad(id_actividad: int):
     try:
-        check = supabase.table("actividad").select("id_actividad").eq("id_actividad", id_actividad).execute()
+        # 1. Obtener la URL de la imagen de la actividad antes de eliminarla
+        check = supabase.table("actividad").select("id_actividad, img_actv").eq("id_actividad", id_actividad).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="Actividad no encontrada para eliminar")
 
+        img_antigua = check.data[0].get("img_actv")
+
+        # 2. Eliminar registros en tablas hijas
         supabase.table("puntaje_act").delete().eq("id_actividad", id_actividad).execute()
         supabase.table("cupo_actividad").delete().eq("id_actividad", id_actividad).execute()
         supabase.table("lugar_actividad").delete().eq("id_actividad", id_actividad).execute()
         supabase.table("requisito_participacion").delete().eq("id_actividad", id_actividad).execute()
         supabase.table("calendario").delete().eq("id_actividad", id_actividad).execute()
 
+        # 3. Eliminar la actividad de la tabla principal
         supabase.table("actividad").delete().eq("id_actividad", id_actividad).execute()
 
-        return {"mensaje": f"Actividad {id_actividad} y todos sus registros asociados fueron eliminados correctamente"}
+        # 4. Eliminar el archivo de imagen del Storage
+        if img_antigua:
+            eliminar_imagen_storage(img_antigua)
+
+        return {"mensaje": f"Actividad {id_actividad} e imagen asociada fueron eliminadas correctamente"}
 
     except HTTPException:
         raise
