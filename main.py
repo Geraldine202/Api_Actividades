@@ -584,3 +584,22 @@ def obtener_sedes():
         return res.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # ==========================================
+# CRUD SOLICITUDES DE CANJE
+# ==========================================
+
+QUERY_RELACIONES_CANJE = """
+    *,
+    estado_canje(descripcion),
+    premio(descripcion, imagen),
+    usuario(nombre_completo, correo)
+"""
+
+@app.get("/solicitudes-canje", tags=["Canjes"])
+def obtener_solicitudes_canje():
+    try:
+        res = supabase.table("solicitud_canje").select(QUERY_RELACIONES_CANJE).order("id_canje", desc=True).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
