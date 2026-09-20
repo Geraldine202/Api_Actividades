@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -595,11 +596,164 @@ QUERY_RELACIONES_CANJE = """
     premio(descripcion, imagen),
     usuario(nombre_completo, correo)
 """
-
+@app.get("/consejeros", tags=["Catálogos"])
+def obtener_consejeros():
+    """
+    Obtiene específicamente los usuarios con rol de Consejero de Carrera (suponiendo id_tipo_usuario = 3)
+    """
+    try:
+        res = supabase.table("usuario")\
+            .select("rut_usuario, nombre_completo, correo, id_tipo_usuario")\
+            .eq("id_tipo_usuario", 4)\
+            .execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/solicitudes-canje", tags=["Canjes"])
 def obtener_solicitudes_canje():
     try:
         res = supabase.table("solicitud_canje").select(QUERY_RELACIONES_CANJE).order("id_canje", desc=True).execute()
         return res.data
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+def generar_formatos_rut(rut: str) -> list[str]:
+    """
+    Limpia cualquier RUT recibido y genera sus variantes
+    sin romper la ejecución de Python.
+    """
+    if not rut:
+        return []
+
+    # Extraemos únicamente dígitos y K/k
+    limpio = re.sub(r"[^0-9kK]", "", str(rut)).upper()
+    if len(limpio) < 2:
+        return [rut]
+
+    cuerpo = limpio[:-1]
+    dv = limpio[-1]
+
+    # Formato 1: Con puntos y guión (ej: 11.111.111-1)
+    # Formateamos solo cuando cuerpo son únicamente dígitos
+    if cuerpo.isdigit():
+        cuerpo_puntos = f"{int(cuerpo):,}".replace(",", ".")
+    else:
+        cuerpo_puntos = cuerpo
+        
+    rut_puntos = f"{cuerpo_puntos}-{dv}"
+
+    # Formato 2: Con guión sin puntos (ej: 11111111-1)
+    rut_guion = f"{cuerpo}-{dv}"
+
+    # Formato 3: Solo caracteres limpios (ej: 111111111)
+    rut_limpio = f"{cuerpo}{dv}"
+
+    # Retornamos las variantes sin duplicados
+    return list(set([rut, rut_puntos, rut_guion, rut_limpio]))
+
+
+@app.get("/actividades/conteo/usuario/{rut_usuario}", tags=["Actividades"])
+def obtener_conteo_actividades_por_usuario(rut_usuario: str):
+    """
+    Retorna el conteo exacto de actividades creadas por el RUT especificado.
+    """
+    try:
+        formatos = generar_formatos_rut(rut_usuario)
+        
+        # Construimos la condición OR para Supabase
+        condicion_or = ",".join([f"rut_usuario.eq.{f}" for f in formatos])
+
+        res = (
+            supabase.table("actividad")
+            .select("id_actividad", count="exact")
+            .or_(condicion_or)
+            .execute()
+        )
+
+        total = res.count if res.count is not None else len(res.data or [])
+
+        return {
+            "rut_usuario": rut_usuario,
+            "total_actividades": total
+        }
+    except Exception as e:
+        print(f"Error crítico en /actividades/conteo/usuario/{rut_usuario}: {e}")
+        # Enviar detalle limpio en lugar de crash 500 silencioso
+        raise HTTPException(status_code=500, detail=f"Error en consulta de actividades: {str(e)}")
+
+
+@app.get("/actividades/usuario/{rut_usuario}", tags=["Actividades"])
+def obtener_actividades_por_usuario(rut_usuario: str):
+    """
+    Retorna la lista completa de actividades asociadas a un usuario.
+    """
+    try:
+        formatos = generar_formatos_rut(rut_usuario)
+        condicion_or = ",".join([f"rut_usuario.eq.{f}" for f in formatos])
+
+        res = (
+            supabase.table("actividad")
+            .select(QUERY_RELACIONES_ACTIVIDAD)
+            .or_(condicion_or)
+            .order("id_actividad", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        print(f"Error crítico en /actividades/usuario/{rut_usuario}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/usuario/sesion/{rut_o_token}", tags=["Usuarios"])
+def obtener_usuario_por_sesion(rut_o_token: str):
+    """
+    Busca al usuario por su RUT o por su Token registrado en sesion_usuario,
+    retornando sus datos personales y su puntaje total de la tabla puntaje_total.
+    """
+    try:
+        # 1. Verificar si viene un token registrado en sesion_usuario
+        res_sesion = (
+            supabase.table("sesion_usuario")
+            .select("rut_usuario")
+            .eq("token_acceso", rut_o_token)
+            .execute()
+        )
+
+        rut_final = res_sesion.data[0]["rut_usuario"] if res_sesion.data else rut_o_token
+
+        # 2. Consultar la información del usuario
+        formatos = generar_formatos_rut(rut_final)
+        condicion_or = ",".join([f'rut_usuario.eq."{f}"' for f in formatos])
+
+        res_usuario = (
+            supabase.table("usuario")
+            .select("rut_usuario, nombre_completo, correo, id_tipo_usuario, id_sede")
+            .or_(condicion_or)
+            .execute()
+        )
+
+        if not res_usuario.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        user_data = res_usuario.data[0]
+
+        # 3. Consultar sus puntos reales desde la tabla puntaje_total
+        res_puntos = (
+            supabase.table("puntaje_total")
+            .select("puntaje")
+            .or_(condicion_or)
+            .execute()
+        )
+
+        puntos_acumulados = res_puntos.data[0]["puntaje"] if res_puntos.data else 0
+
+        # Combinar los datos
+        user_data["puntaje_total"] = puntos_acumulados
+
+        return user_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error consultando sesión de usuario: {e}")
         raise HTTPException(status_code=500, detail=str(e))
