@@ -3,18 +3,27 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from pydantic import BaseModel
 from typing import List
 from datetime import date, time
+import smtplib
+from email.message import EmailMessage
+from fastapi.responses import JSONResponse
 load_dotenv()
+
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("CRÍTICO: No se encontraron las credenciales en el archivo .env")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Faltan las credenciales SUPABASE_URL o SUPABASE_KEY en el archivo .env")
@@ -51,6 +60,18 @@ class EstudianteAsistencia(BaseModel):
 
 class CargaAsistenciaBatch(BaseModel):
     estudiantes: List[EstudianteAsistencia]
+
+class CanjeCreate(BaseModel):
+    rut_usuario: str      
+    id_premio: str | int
+
+class CanjeRequest(BaseModel):
+    rut_alumno: str
+    id_premio: int
+    lugar_entrega: str = "Sede"
+class ProcesarSolicitudPayload(BaseModel):
+    id_estado: int  # 2 = Aprobado, 3 = Rechazado
+    observacion: Optional[str] = None
 # ==========================================
 # CONSULTAS CON RELACIONES (JOINs)
 # ==========================================
@@ -216,8 +237,9 @@ class ActividadUpdate(BaseModel):
     cupos: Optional[int] = None
     lugar: Optional[str] = None
     requisito: Optional[str] = None
-
-
+class ProcesarSolicitudPayload(BaseModel):
+    id_estado: int  # 2 = Aprobado, 3 = Rechazado
+    observacion: Optional[str] = None
 class PremioCreate(BaseModel):
     descripcion: str
     valor: int = 0
@@ -346,9 +368,6 @@ def calcular_estado_dinamico(actividad: dict) -> dict:
 # CRUD ACTIVIDADES
 # ==========================================
 
-
-from datetime import datetime, date, time
-from fastapi import HTTPException, status
 
 @app.get("/actividades", tags=["Actividades"])
 def obtener_actividades():
@@ -694,14 +713,16 @@ def actividad_ha_finalizado(actividad_data: dict) -> bool:
         print(f"Error al evaluar si la actividad ha finalizado: {e}")
         return False
 
+
+
 def actualizar_puntaje_total_alumno(rut_usuario_param: str):
     """
     Suma ÚNICAMENTE los puntos de las actividades a las que el alumno asistió (presente = True)
     Y que además YA HAYAN FINALIZADO (fecha + hora_termino <= datetime.now()), 
-    luego actualiza la tabla 'puntaje_total'.
+    luego actualiza la tabla 'puntaje_total' y notifica los puntos ganados.
     """
     try:
-        # 1. Obtener RUT real en caso de que venga un Token de sesión
+        # 1. Obtener RUT real
         res_sesion = (
             supabase.table("sesion_usuario")
             .select("rut_usuario")
@@ -711,12 +732,13 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str):
         rut_real = res_sesion.data[0]["rut_usuario"] if res_sesion.data else rut_usuario_param
         formatos = generar_formatos_rut(rut_real)
 
-        # 2. Consultar asistencias CONFIRMADAS (presente = True) junto con los datos de fecha/hora de la actividad
+        # 2. Consultar asistencias CONFIRMADAS
         res_asistencia = (
             supabase.table("asistencia_act")
             .select("""
                 id_actividad,
                 actividad (
+                    nombre_actividad,
                     fecha,
                     hora_termino
                 )
@@ -726,16 +748,26 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str):
             .execute()
         )
 
-        # 3. Filtrar solo las actividades que ya hayan finalizado
+        # 3. Filtrar actividades finalizadas y mapear nombres
         actividades_asistidas_y_finalizadas = []
+        mapa_nombres_actividades = {}
+
         for item in (res_asistencia.data or []):
-            act_data = item.get("actividad")
+            raw_act = item.get("actividad")
+            # Supabase a veces retorna la relación como una lista
+            act_data = raw_act[0] if isinstance(raw_act, list) and raw_act else raw_act
+
             if act_data and actividad_ha_finalizado(act_data):
-                actividades_asistidas_y_finalizadas.append(item["id_actividad"])
+                id_act = item["id_actividad"]
+                actividades_asistidas_y_finalizadas.append(id_act)
+                mapa_nombres_actividades[id_act] = (
+                    act_data.get("nombre_actividad") or f"la actividad #{id_act}"
+                )
 
         total_acumulado = 0
+        puntos_por_actividad = {}
 
-        # 4. Sumar los puntos asignados en 'puntaje_act' para cada actividad finalizada
+        # 4. Sumar los puntos asignados
         if actividades_asistidas_y_finalizadas:
             res_pts = (
                 supabase.table("puntaje_act")
@@ -744,7 +776,6 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str):
                 .execute()
             )
             
-            puntos_por_actividad = {}
             for item in (res_pts.data or []):
                 id_act = item.get("id_actividad")
                 cant = item.get("cantidad", 0)
@@ -776,21 +807,146 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str):
             }).execute()
 
         print(f"Puntaje total actualizado con éxito para {rut_real}: {total_acumulado} pts")
+
+        # 6. ENVIAR NOTIFICACIÓN Y CORREO DE PUNTOS GANADOS
+        try:
+            res_usr = supabase.table("usuario").select("*").in_("rut_usuario", formatos).execute()
+            correo_alumno = None
+            if res_usr.data:
+                usr = res_usr.data[0]
+                correo_alumno = usr.get("correo") or usr.get("email")
+
+            # Buscar notificaciones que sean de "Puntos" para verificar duplicados
+            res_notis_previas = (
+                supabase.table("notificacion")
+                .select("mensaje")
+                .in_("rut_usuario", formatos)
+                .ilike("mensaje", "%Completaste%")  # <--- CORRECCIÓN: Filtra solo las notificaciones de puntos ganados
+                .execute()
+            )
+            mensajes_existentes = [n.get("mensaje", "") for n in (res_notis_previas.data or [])]
+
+            for id_act, pts in puntos_por_actividad.items():
+                nom_act = mapa_nombres_actividades.get(id_act, f"la actividad #{id_act}")
+                msg_notificacion = f"¡Felicitaciones! Completaste '{nom_act}' y ganaste +{pts} puntos. Tu saldo total actual es de {total_acumulado} pts."
+
+                # Validar que esta notificación específica de puntos no se haya enviado ya
+                ya_notificado = any(nom_act in m for m in mensajes_existentes)
+
+                if not ya_notificado:
+                    # A) Guardar en BD (id_tipo_notificacion = 2 para puntos)
+                    supabase.table("notificacion").insert({
+                        "rut_usuario": rut_real,
+                        "mensaje": msg_notificacion,
+                        "fecha_envio": datetime.now().isoformat(),
+                        "leido": False,
+                        "id_tipo_notificacion": 2  # <--- Cambiado a 2 para diferenciar de la inscripción
+                    }).execute()
+
+                    # B) Enviar Correo
+                    if correo_alumno:
+                        print(f"[INFO] Enviando correo de puntos acreditados a: {correo_alumno}")
+                        enviar_correo_inscripcion(
+                            destinatario=correo_alumno,
+                            nombre_actividad=nom_act,
+                            asunto=f"¡Puntos Acreditados! - {nom_act}",
+                            mensaje_cuerpo=f"""
+                                ¡Felicitaciones! Se ha confirmado tu asistencia a la actividad <b>{nom_act}</b>.<br><br>
+                                🎉 <b>Puntos ganados:</b> +{pts} pts<br>
+                                🏆 <b>Puntaje Total Acumulado:</b> {total_acumulado} pts
+                            """
+                        )
+        except Exception as e_noti_mail:
+            print(f"[WARN] No se pudo procesar la notificación/correo automático: {e_noti_mail}")
+
         return total_acumulado
 
     except Exception as e:
         print(f"Error al consolidar puntaje total para {rut_usuario_param}: {e}")
         return 0
-
 @app.get("/puntaje-total/{rut_o_token}", tags=["Puntaje"])
 def obtener_y_actualizar_puntaje_total(rut_o_token: str):
     """
-    Recalcula el puntaje acumulado con las actividades asistidas/finalizadas,
-    actualiza la tabla 'puntaje_total' y devuelve el resultado.
+    Recalcula el puntaje acumulado devolviendo el total del alumno.
+    Soporta tanto RUT directo como Token de Sesión.
     """
-    total = actualizar_puntaje_total_alumno(rut_o_token)
-    return {"puntaje": total}   
+    try:
+        token_o_rut = rut_o_token.strip()
 
+        # 1. Traducir Token a RUT si aplica
+        res_sesion = (
+            supabase.table("sesion_usuario")
+            .select("rut_usuario")
+            .eq("token_acceso", token_o_rut)
+            .execute()
+        )
+
+        rut_evaluar = (
+            res_sesion.data[0]["rut_usuario"] 
+            if (res_sesion.data and len(res_sesion.data) > 0) 
+            else token_o_rut
+        )
+
+        # 2. Obtener el RUT real del alumno
+        formatos = generar_formatos_rut(rut_evaluar)
+        res_usuario = (
+            supabase.table("usuario")
+            .select("rut_usuario")
+            .in_("rut_usuario", formatos)
+            .execute()
+        )
+
+        rut_final = res_usuario.data[0]["rut_usuario"] if res_usuario.data else rut_evaluar
+
+        # 3. Calcular con el RUT limpio
+        total = actualizar_puntaje_total_alumno(rut_final)
+        return {"puntaje": total}
+
+    except Exception as e:
+        print(f"[WARN] No se pudo consolidar puntaje para {rut_o_token}: {e}")
+        return {"puntaje": 0}
+
+def enviar_correo_inscripcion(destinatario: str, nombre_actividad: str, asunto: str = None, mensaje_cuerpo: str = None):
+    """Envía un correo electrónico al alumno con los colores de Aquí Todos Ganan."""
+    try:
+        email_emisor = os.getenv("EMAIL_USER")
+        password_emisor = os.getenv("EMAIL_PASS")
+
+        if not email_emisor or not password_emisor:
+            print("[WARN] No se configuraron credenciales de email en .env")
+            return
+
+        asunto_mail = asunto or f"¡Inscripción Confirmada! - {nombre_actividad}"
+        cuerpo_mail = mensaje_cuerpo or f"Te has inscrito correctamente a la actividad: <b>{nombre_actividad}</b>."
+
+        msg = EmailMessage()
+        msg['Subject'] = asunto_mail
+        msg['From'] = email_emisor
+        msg['To'] = destinatario
+
+        contenido_html = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; background-color: #031326; color: #ffffff; padding: 20px;">
+                <div style="max-width: 500px; margin: 0 auto; background-color: #071a30; border: 1px solid #f5b800; border-radius: 12px; padding: 25px; text-align: center;">
+                    <h1 style="color: #f5b800; margin-bottom: 10px;">Aquí Todos Ganan</h1>
+                    <hr style="border: 0; height: 1px; background: #f5b800; margin: 20px 0;">
+                    <div style="color: #cbd5e1; font-size: 15px; line-height: 1.6; margin: 15px 0;">
+                        {cuerpo_mail}
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+        msg.add_alternative(contenido_html, subtype='html')
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(email_emisor, password_emisor)
+            smtp.send_message(msg)
+
+        print(f"[SUCCESS] Correo enviado exitosamente a {destinatario}")
+
+    except Exception as e:
+        print(f"[WARN] Error al enviar el correo: {e}")
 
 @app.post("/inscripciones", status_code=status.HTTP_201_CREATED, tags=["Inscripciones"])
 def inscribir_alumno_actividad(datos: InscripcionCreate):
@@ -818,7 +974,7 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         formatos = generar_formatos_rut(rut_evaluar)
         res_usuario = (
             supabase.table("usuario")
-            .select("rut_usuario")
+            .select("rut_usuario", "correo")
             .in_("rut_usuario", formatos)
             .execute()
         )
@@ -827,6 +983,7 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
             raise HTTPException(status_code=404, detail="El alumno no se encuentra registrado")
 
         rut_real = res_usuario.data[0]["rut_usuario"]
+        correo_alumno = res_usuario.data[0].get("correo")
 
         # 2. Validar que no exista inscripción previa
         check_insc = (
@@ -840,10 +997,10 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         if check_insc.data:
             raise HTTPException(status_code=400, detail="El alumno ya está inscrito en esta actividad")
 
-        # 3. Obtener fecha y hora de la actividad
+        # 3. Obtener fecha, hora y NOMBRE de la actividad (SE AGREGA EL SELECT CON NOMBRES O '*')
         res_act = (
             supabase.table("actividad")
-            .select("fecha", "hora_termino")
+            .select("*")  # <--- CORRECCIÓN AQUÍ: Se trae todo para asegurar los campos de nombre, fecha y hora
             .eq("id_actividad", datos.id_actividad)
             .execute()
         )
@@ -852,6 +1009,12 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
             raise HTTPException(status_code=404, detail="La actividad no existe")
 
         act_data = res_act.data[0]
+        nombre_act = (
+            act_data.get("nombre_actividad") or 
+            act_data.get("nombre") or 
+            act_data.get("titulo") or 
+            f"Actividad {datos.id_actividad}"
+        )
         fecha_act = act_data["fecha"]
         hora_term = act_data["hora_termino"]
 
@@ -869,7 +1032,27 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
 
         res_ins = supabase.table("inscripcion_act").insert(nueva_inscripcion).execute()
 
-        # 5. Descontar cupo
+        # 5. CREAR NOTIFICACIÓN AUTOMÁTICA (id_tipo_notificacion = 1)
+        try:
+            nueva_notificacion = {
+                "rut_usuario": rut_real,
+                "mensaje": f"¡Inscripción exitosa! Te has inscrito correctamente en: {nombre_act}.",
+                "fecha_envio": now.isoformat(),
+                "leido": False,
+                "id_tipo_notificacion": 1  # 1: Inscripción a Actividad
+            }
+            supabase.table("notificacion").insert(nueva_notificacion).execute()
+        except Exception as e_noti:
+            print(f"[WARN] No se pudo crear la notificación de inscripción: {e_noti}")
+
+        # 5.1 Enviar correo    
+        try:
+            if correo_alumno:
+                enviar_correo_inscripcion(correo_alumno, nombre_act)
+        except Exception as e_email:
+            print(f"[WARN] No se pudo enviar el correo de inscripción: {e_email}")
+
+        # 6. Descontar cupo
         try:
             res_cupo = (
                 supabase.table("cupo_actividad")
@@ -898,8 +1081,7 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         raise HTTPException(
             status_code=500, 
             detail=f"Error en inscripción: {str(e)}"
-        )
-    
+        )  
 @app.post("/actividades/{id_actividad}/asistencia", tags=["Asistencia"])
 def registrar_asistencia_actividad(id_actividad: int, datos: CargaAsistenciaBatch):
     """
@@ -986,7 +1168,7 @@ def registrar_asistencia_actividad(id_actividad: int, datos: CargaAsistenciaBatc
 @app.put("/inscripciones/completar", tags=["Inscripciones"])
 def completar_actividad(rut_alumno: str, id_actividad: int):
     """
-    Acredita la asistencia individual de un alumno y recalcula 'puntaje_total'.
+    Acredita la asistencia individual de un alumno, asigna puntos y envía correo.
     """
     try:
         formatos = generar_formatos_rut(rut_alumno)
@@ -1005,7 +1187,20 @@ def completar_actividad(rut_alumno: str, id_actividad: int):
 
         rut_real = res_insc.data[0]["rut_usuario"]
 
-        # Marcar asistencia en 'asistencia_act'
+        # 1. Obtener datos del usuario (evaluando 'correo' o 'email')
+        res_usr = supabase.table("usuario").select("*").eq("rut_usuario", rut_real).execute()
+        correo_alumno = None
+        if res_usr.data:
+            usr = res_usr.data[0]
+            correo_alumno = usr.get("correo") or usr.get("email")
+
+        # 2. Obtener datos de la actividad (evaluando campos posibles)
+        res_act = supabase.table("actividad").select("*").eq("id_actividad", id_actividad).execute()
+        act_info = res_act.data[0] if res_act.data else {}
+        nombre_act = act_info.get("nombre_actividad") or act_info.get("titulo") or f"la actividad #{id_actividad}"
+        puntos_actividad = act_info.get("puntos") or act_info.get("puntos_otorgados") or 0
+
+        # 3. Marcar asistencia en 'asistencia_act'
         payload_asistencia = {
             "fecha_asistencia": datetime.now().isoformat(),
             "presente": True,
@@ -1027,20 +1222,55 @@ def completar_actividad(rut_alumno: str, id_actividad: int):
         else:
             supabase.table("asistencia_act").insert(payload_asistencia).execute()
 
-        # Recalcular el puntaje total
+        # 4. Recalcular el puntaje total
         nuevo_total = actualizar_puntaje_total_alumno(rut_real)
+
+        # 5. REGISTRAR NOTIFICACIÓN EN BD
+        now = datetime.now()
+        try:
+            msg_exito = f"¡Felicitaciones! Has completado '{nombre_act}' y ganaste +{puntos_actividad} puntos. Tu saldo total actual es de {nuevo_total} puntos."
+            noti_completado = {
+                "rut_usuario": rut_real,
+                "mensaje": msg_exito,
+                "fecha_envio": now.isoformat(),
+                "leido": False,
+                "id_tipo_notificacion": 1
+            }
+            supabase.table("notificacion").insert(noti_completado).execute()
+        except Exception as e_noti:
+            print(f"[WARN] No se pudo crear la notificación de completado: {e_noti}")
+
+        # 6. ENVIAR CORREO CON VERIFICACIÓN Y LOGS
+        if correo_alumno:
+            print(f"[INFO] Intentando enviar correo de puntos acreditados a: {correo_alumno}")
+            try:
+                enviar_correo_inscripcion(
+                    destinatario=correo_alumno,
+                    nombre_actividad=nombre_act,
+                    asunto=f"¡Puntos Acreditados! - {nombre_act}",
+                    mensaje_cuerpo=f"""
+                        ¡Felicitaciones! Se ha confirmado tu asistencia a la actividad <b>{nombre_act}</b>.<br><br>
+                        🎉 <b>Puntos ganados:</b> +{puntos_actividad} pts<br>
+                        🏆 <b>Puntaje Total Acumulado:</b> {nuevo_total} pts
+                    """
+                )
+            except Exception as e_mail:
+                print(f"[WARN] Falló la conexión SMTP al enviar correo: {e_mail}")
+        else:
+            print(f"[WARN] No se envió correo porque no se encontró email para el RUT {rut_real}")
 
         return {
             "mensaje": "Actividad completada exitosamente. Asistencia registrada y puntaje acreditado.",
+            "puntos_ganados": puntos_actividad,
             "puntaje_total_actual": nuevo_total
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[ERROR COMPLETAR ACTIVIDAD]: {e}")
         raise HTTPException(status_code=500, detail=f"Error al completar actividad: {str(e)}")
-
-
+    
 @app.get("/inscripciones/alumno/{rut_o_token}", tags=["Inscripciones"])
 def obtener_inscripciones_por_alumno(rut_o_token: str):
     try:
@@ -1279,7 +1509,7 @@ def desinscribir_alumno_actividad(rut_alumno: str, id_actividad: int):
         formatos = generar_formatos_rut(rut_alumno)
         condicion_or = ",".join([f'rut_usuario.eq."{f}"' for f in formatos])
 
-        # 1. Buscar la inscripción
+        # 1. Buscar la inscripción y obtener datos del usuario (correo)
         res_ins = (
             supabase.table("inscripcion_act")
             .select("id_inscripcion, rut_usuario")
@@ -1294,6 +1524,13 @@ def desinscribir_alumno_actividad(rut_alumno: str, id_actividad: int):
         id_inscripcion = res_ins.data[0]["id_inscripcion"]
         rut_real = res_ins.data[0]["rut_usuario"]
 
+        # Obtener correo del alumno y nombre de la actividad para las notificaciones
+        res_usr = supabase.table("usuario").select("correo").eq("rut_usuario", rut_real).execute()
+        correo_alumno = res_usr.data[0].get("correo") if res_usr.data else None
+
+        res_act = supabase.table("actividad").select("nombre_actividad").eq("id_actividad", id_actividad).execute()
+        nombre_act = res_act.data[0].get("nombre_actividad") if res_act.data else f"la actividad #{id_actividad}"
+
         # 2. VALIDACIÓN DE ASISTENCIA: Verificar si el alumno ya asistió
         res_asis = (
             supabase.table("asistencia_act")
@@ -1304,7 +1541,6 @@ def desinscribir_alumno_actividad(rut_alumno: str, id_actividad: int):
         )
 
         if res_asis.data and len(res_asis.data) > 0:
-            # Evaluar si la asistencia está marcada como verdadera
             asistio = any(a.get("presente") is True for a in res_asis.data)
             if asistio:
                 raise HTTPException(
@@ -1315,11 +1551,37 @@ def desinscribir_alumno_actividad(rut_alumno: str, id_actividad: int):
         # 3. Eliminar inscripción
         supabase.table("inscripcion_act").delete().eq("id_inscripcion", id_inscripcion).execute()
 
-        # 4. Eliminar registro de asistencia no efectiva (si existía con presente = False)
+        # 4. Eliminar registro de asistencia no efectiva
         supabase.table("asistencia_act").delete().eq("id_actividad", id_actividad).in_("rut_usuario", formatos).execute()
 
         # 5. Recalcular el puntaje acumulado
         actualizar_puntaje_total_alumno(rut_real)
+
+        # 6. REGISTRAR NOTIFICACIÓN EN LA APP
+        now = datetime.now()
+        try:
+            noti_retiro = {
+                "rut_usuario": rut_real,
+                "mensaje": f"Has anulado tu inscripción en la actividad: {nombre_act}.",
+                "fecha_envio": now.isoformat(),
+                "leido": False,
+                "id_tipo_notificacion": 1
+            }
+            supabase.table("notificacion").insert(noti_retiro).execute()
+        except Exception as e_noti:
+            print(f"[WARN] No se pudo crear notificación de desinscripción: {e_noti}")
+
+        # 7. ENVIAR CORREO ELECTRÓNICO DE RETIRO
+        try:
+            if correo_alumno:
+                enviar_correo_inscripcion(
+                    destinatario=correo_alumno,
+                    nombre_actividad=nombre_act,
+                    asunto=f"Confirmación de retiro - {nombre_act}",
+                    mensaje_cuerpo=f"Te informamos que se ha procesado con éxito tu desinscripción de la actividad: <b>{nombre_act}</b>."
+                )
+        except Exception as e_mail:
+            print(f"[WARN] No se pudo enviar el correo de desinscripción: {e_mail}")
 
         return {"mensaje": "Desinscripción realizada con éxito"}
 
@@ -1327,7 +1589,7 @@ def desinscribir_alumno_actividad(rut_alumno: str, id_actividad: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al desinscribir: {str(e)}")
-
+    
 @app.get("/actividades/{id_actividad}/lista-inscritos", tags=["Actividades"])
 def obtener_lista_estudiantes_inscritos(id_actividad: int):
     """
@@ -1387,6 +1649,7 @@ def obtener_lista_estudiantes_inscritos(id_actividad: int):
 # CRUD PREMIOS
 # ==========================================
 
+# 1. Rutas generales sin parámetros en la URL
 @app.get("/premios", tags=["Premios"])
 def obtener_premios():
     try:
@@ -1396,6 +1659,60 @@ def obtener_premios():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# 2. Rutas estáticas específicas (¡DEBE IR ANTES DE /{id_premio}!)
+@app.get("/premios/solicitudes", tags=["Administración Canjes"])
+def obtener_solicitudes_canje():
+    try:
+        res = (
+            supabase.table("solicitud_canje")
+            .select("""
+                id_canje,
+                fecha_solicitud,
+                costo_puntaje,
+                id_estado_canje,
+                rut_usuario,
+                id_premio,
+                usuario:rut_usuario (
+                    rut_usuario,
+                    nombre_completo,
+                    id_sede,
+                    sede:id_sede (
+                        id_sede,
+                        descripcion
+                    )
+                ),
+                premio:id_premio (
+                    id_premio,
+                    descripcion,
+                    imagen,
+                    puntos_requeridos,
+                    stock_sede (
+                        id_stock,
+                        cantidad,
+                        id_sede
+                    )
+                ),
+                estado_canje:id_estado_canje (
+                    id_estado_canje,
+                    descripcion
+                ),
+                retiro_premio (
+                    id_retiro,
+                    fecha_limite,
+                    retirado
+                )
+            """)
+            .order("fecha_solicitud", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        print(f"[ERROR OBTENER SOLICITUDES]: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al obtener las solicitudes: {str(e)}"
+        )
+# 3. Rutas dinámicas con parámetros al final
 @app.get("/premios/{id_premio}", tags=["Premios"])
 def obtener_premio_por_id(id_premio: int):
     try:
@@ -1407,8 +1724,7 @@ def obtener_premio_por_id(id_premio: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
 @app.post("/premios", status_code=status.HTTP_201_CREATED, tags=["Premios"])
 def crear_premio(premio: PremioCreate):
     try:
@@ -1650,3 +1966,418 @@ def obtener_usuario_por_sesion(rut_o_token: str):
     except Exception as e:
         print(f"Error consultando sesión de usuario ({rut_o_token}): {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# FUNCIÓN AUXILIAR: NOTIFICACIONES SEGÚN TU TABLA
+# ---------------------------------------------------------
+async def registrar_notificacion(rut_usuario: str, id_canje: int, mensaje: str, id_tipo_notificacion: int):
+    supabase.table("notificacion").insert({
+        "rut_usuario": rut_usuario,
+        "id_canje": id_canje,
+        "mensaje": mensaje,
+        "fecha_envio": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "leido": False,
+        "id_tipo_notificacion": id_tipo_notificacion
+    }).execute()
+
+def generar_formatos_rut(rut: str) -> list[str]:
+    """Genera variantes con y sin puntos/guion para búsquedas seguras en Supabase"""
+    clean = rut.replace(".", "").replace("-", "").strip().upper()
+    if len(clean) < 2:
+        return [rut]
+    cuerpo, dv = clean[:-1], clean[-1]
+    
+    # Formato con puntos y guión (ej: 12.345.678-9)
+    cuerpo_fmt = f"{int(cuerpo):,}".replace(",", ".")
+    rut_con_puntos = f"{cuerpo_fmt}-{dv}"
+    
+    # Formato solo con guión (ej: 12345678-9)
+    rut_con_guion = f"{cuerpo}-{dv}"
+    
+    # Formato limpio (ej: 123456789)
+    return list(set([clean, rut_con_guion, rut_con_puntos, rut]))
+
+
+
+
+@app.post("/premios/canjear", status_code=status.HTTP_201_CREATED, tags=["Canjes"])
+def solicitar_canje_premio(datos: CanjeRequest):
+    """
+    Registra la solicitud de canje en la BD (Pendiente de aprobación):
+    1. Resuelve sesión y datos del alumno (incluyendo id_sede).
+    2. Obtiene el estado 'Solicitado' de estado_canje.
+    3. Valida puntos del alumno (sin descontar en BD).
+    4. Valida stock ESTRICTO en 'stock_sede' para la sede del alumno (sin descontar en BD).
+    5. Inserta registros en detalle_canje, historial_canje y solicitud_canje.
+    6. Genera notificación de confirmación de solicitud enviada.
+    """
+    try:
+        rut_o_token = datos.rut_alumno.strip()
+
+        # 1. Obtener el RUT desde sesion_usuario si mandan token
+        res_sesion = (
+            supabase.table("sesion_usuario")
+            .select("rut_usuario")
+            .eq("token_acceso", rut_o_token)
+            .execute()
+        )
+        rut_evaluar = (
+            res_sesion.data[0]["rut_usuario"] 
+            if (res_sesion.data and len(res_sesion.data) > 0) 
+            else rut_o_token
+        )
+        formatos_rut = generar_formatos_rut(rut_evaluar)
+
+        # 2. Obtener datos del Usuario (para conocer su id_sede exacta)
+        res_user = (
+            supabase.table("usuario")
+            .select("rut_usuario", "id_sede", "nombre_completo")
+            .in_("rut_usuario", formatos_rut)
+            .execute()
+        )
+        if not res_user.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado en la base de datos.")
+
+        usuario = res_user.data[0]
+        rut_real = usuario["rut_usuario"]
+        id_sede_usuario = usuario.get("id_sede")
+
+        if not id_sede_usuario:
+            raise HTTPException(status_code=400, detail="El usuario no tiene una sede asignada en el sistema.")
+
+        # 3. Obtener el id_estado_canje para 'Solicitado'
+        res_estado = (
+            supabase.table("estado_canje")
+            .select("id_estado_canje")
+            .ilike("descripcion", "%Solicitado%")
+            .execute()
+        )
+        if not res_estado.data:
+            res_estado = supabase.table("estado_canje").select("id_estado_canje").limit(1).execute()
+            if not res_estado.data:
+                raise HTTPException(status_code=500, detail="No existen estados configurados en 'estado_canje'.")
+
+        id_estado_solicitado = res_estado.data[0]["id_estado_canje"]
+
+        # 4. Validar Puntos Disponibles del Alumno en 'puntaje_total'
+        res_pts = (
+            supabase.table("puntaje_total")
+            .select("id_puntaje", "puntaje")
+            .in_("rut_usuario", formatos_rut)
+            .execute()
+        )
+        if not res_pts.data:
+            raise HTTPException(status_code=400, detail="El alumno no tiene un registro de puntaje asignado.")
+
+        reg_puntaje = res_pts.data[0]
+        puntos_actuales = reg_puntaje.get("puntaje", 0)
+
+        # 5. Obtener datos del Premio
+        res_premio = (
+            supabase.table("premio")
+            .select("*")
+            .eq("id_premio", datos.id_premio)
+            .execute()
+        )
+        if not res_premio.data:
+            raise HTTPException(status_code=404, detail="El premio seleccionado no existe.")
+
+        premio = res_premio.data[0]
+        puntos_requeridos = premio.get("puntos_requeridos", 0)
+        descripcion_premio = premio.get("descripcion", "Premio de Catálogo")
+
+        # VALIDACIÓN 1: Puntos suficientes para solicitar
+        if puntos_actuales < puntos_requeridos:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Puntos insuficientes. Tienes {puntos_actuales} pts y el premio requiere {puntos_requeridos} pts."
+            )
+
+        # 6. Validar Stock ESTRICTO en 'stock_sede' para la sede del alumno
+        res_stock = (
+            supabase.table("stock_sede")
+            .select("id_stock", "cantidad")
+            .eq("id_premio", datos.id_premio)
+            .eq("id_sede", id_sede_usuario)
+            .execute()
+        )
+
+        if not res_stock.data:
+            raise HTTPException(
+                status_code=400, 
+                detail="Este premio no está configurado ni disponible en tu sede actual."
+            )
+
+        reg_stock = res_stock.data[0]
+        stock_actual = reg_stock.get("cantidad", 0)
+
+        # VALIDACIÓN 2: Stock disponible en sede
+        if stock_actual <= 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="Este premio se encuentra agotado en tu sede."
+            )
+
+        now_str = datetime.now().isoformat()
+
+        # 7. REGISTRO DE SOLICITUD EN BD (Sin tocar saldos de puntos ni stock aún)
+
+        # A) Insertar en 'detalle_canje'
+        res_detalle = supabase.table("detalle_canje").insert({
+            "fecha": now_str,
+            "descripcion": f"Solicitud Canje: {descripcion_premio}",
+            "lugar_entrega": datos.lugar_entrega,
+            "puntos_usados": puntos_requeridos
+        }).execute()
+
+        if not res_detalle.data:
+            raise HTTPException(status_code=500, detail="Error al generar el detalle de la solicitud.")
+        id_detalle = res_detalle.data[0]["id_detalle"]
+
+        # B) Insertar en 'historial_canje'
+        res_historial = supabase.table("historial_canje").insert({
+            "fecha_canje": now_str,
+            "rut_usuario": rut_real
+        }).execute()
+
+        if not res_historial.data:
+            raise HTTPException(status_code=500, detail="Error al registrar el historial de la solicitud.")
+        id_historial_canje = res_historial.data[0]["id_historial_canje"]
+
+        # C) Insertar en 'solicitud_canje' (Con el estado Solicitado)
+        res_solicitud = supabase.table("solicitud_canje").insert({
+            "fecha_solicitud": now_str,
+            "costo_puntaje": puntos_requeridos,
+            "id_estado_canje": id_estado_solicitado,
+            "id_historial_canje": id_historial_canje,
+            "rut_usuario": rut_real,
+            "id_premio": datos.id_premio,
+            "id_detalle": id_detalle
+        }).execute()
+
+        if not res_solicitud.data:
+            raise HTTPException(status_code=500, detail="Error al guardar la solicitud de canje.")
+        id_canje = res_solicitud.data[0]["id_canje"]
+
+        # 8. NOTIFICACIÓN INFORMATIVA AL ALUMNO
+        try:
+            res_tipo = supabase.table("tipo_notificacion").select("id_tipo_notificacion").limit(1).execute()
+            id_tipo = res_tipo.data[0]["id_tipo_notificacion"] if res_tipo.data else 1
+
+            supabase.table("notificacion").insert({
+                "mensaje": f"Solicitud de canje #{id_canje} enviada para '{descripcion_premio}'. Pendiente de aprobación.",
+                "fecha_envio": now_str,
+                "leido": False,
+                "id_canje": id_canje,
+                "id_tipo_notificacion": id_tipo,
+                "rut_usuario": rut_real
+            }).execute()
+        except Exception as e_noti:
+            print(f"[WARN] No se pudo crear la notificación del canje: {e_noti}")
+
+        # Se retorna el saldo de puntos intacto y la confirmación de la solicitud
+        return {
+            "mensaje": f"¡Solicitud de canje #{id_canje} registrada con éxito! Pendiente de aprobación por un administrador.",
+            "saldo_restante": puntos_actuales,
+            "id_canje": id_canje
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR CANJE SOLICITUD]: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno procesando la solicitud de canje: {str(e)}"
+        )
+
+
+
+
+
+# ---------------------------------------------------------
+# 0. OBTENER TODO EL HISTORIAL DE CANJES
+# ---------------------------------------------------------
+@app.get("/canjes/historial", tags=["Canjes"])
+async def obtener_historial_canjes():
+    try:
+        # Incluye relaciones completas con usuario, premio, estado, detalle y retiro
+        res = supabase.table("solicitud_canje")\
+            .select("""
+                id_canje,
+                fecha_solicitud,
+                costo_puntaje,
+                id_estado_canje,
+                rut_usuario,
+                id_premio,
+                usuario (nombre_completo, correo),
+                premio (descripcion, imagen, puntos_requeridos),
+                estado_canje (descripcion),
+                detalle_canje (descripcion, lugar_entrega, puntos_usados),
+                retiro_premio (id_retiro, fecha_limite, retirado)
+            """)\
+            .order("fecha_solicitud", desc=True)\
+            .execute()
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ENDPOINTS ADMINISTRACIÓN DE CANJES
+# ==========================================
+
+
+
+@app.put("/premios/aprobar/{id_canje}", tags=["Administración Canjes"])
+def aprobar_solicitud_canje(id_canje: int):
+    """
+    Aprueba una solicitud diferida:
+    1. Verifica que la solicitud exista y esté en estado 'Solicitado'.
+    2. Re-valida que el usuario conserve puntos suficientes.
+    3. Re-valida el stock actual en la sede del usuario.
+    4. Ejecuta el descuento de puntos en 'puntaje_total' y stock en 'stock_sede'.
+    5. Actualiza el estado a 'Aprobado'.
+    6. Notifica al estudiante.
+    """
+    try:
+        # 1. Obtener la solicitud
+        res_sol = supabase.table("solicitud_canje").select("*").eq("id_canje", id_canje).execute()
+        if not res_sol.data:
+            raise HTTPException(status_code=404, detail="Solicitud de canje no encontrada.")
+        
+        solicitud = res_sol.data[0]
+        rut_usuario = solicitud["rut_usuario"]
+        id_premio = solicitud["id_premio"]
+        costo_puntos = solicitud["costo_puntaje"]
+
+        # Obtener id de estado 'Aprobado'
+        res_est_aprobado = supabase.table("estado_canje").select("id_estado_canje").ilike("descripcion", "%Aprobado%").execute()
+        if not res_est_aprobado.data:
+            raise HTTPException(status_code=500, detail="Estado 'Aprobado' no configurado.")
+        id_estado_aprobado = res_est_aprobado.data[0]["id_estado_canje"]
+
+        if solicitud["id_estado_canje"] == id_estado_aprobado:
+            raise HTTPException(status_code=400, detail="Esta solicitud ya ha sido aprobada previamente.")
+
+        # 2. Validar puntos del alumno
+        formatos_rut = generar_formatos_rut(rut_usuario)
+        res_pts = supabase.table("puntaje_total").select("id_puntaje", "puntaje").in_("rut_usuario", formatos_rut).execute()
+        if not res_pts.data:
+            raise HTTPException(status_code=400, detail="El alumno no posee registro de puntaje.")
+        
+        reg_pts = res_pts.data[0]
+        puntos_actuales = reg_pts.get("puntaje", 0)
+        if puntos_actuales < costo_puntos:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"El alumno ya no tiene puntos suficientes ({puntos_actuales} pts disponibles, requiere {costo_puntos} pts)."
+            )
+
+        # 3. Validar stock en la sede del usuario
+        res_user = supabase.table("usuario").select("id_sede").in_("rut_usuario", formatos_rut).execute()
+        id_sede = res_user.data[0]["id_sede"] if res_user.data else None
+
+        res_stock = supabase.table("stock_sede").select("id_stock", "cantidad").eq("id_premio", id_premio).eq("id_sede", id_sede).execute()
+        if not res_stock.data:
+            res_stock = supabase.table("stock_sede").select("id_stock", "cantidad").eq("id_premio", id_premio).execute()
+
+        if not res_stock.data or res_stock.data[0].get("cantidad", 0) <= 0:
+            raise HTTPException(status_code=400, detail="No hay stock disponible suficiente en la sede para aprobar.")
+
+        reg_stock = res_stock.data[0]
+
+        # 4. APLICAR DESCUENTOS (EFECTIVIZAR CANJE)
+        nuevo_saldo = puntos_actuales - costo_puntos
+        nuevo_stock = reg_stock["cantidad"] - 1
+
+        supabase.table("puntaje_total").update({"puntaje": nuevo_saldo}).eq("id_puntaje", reg_pts["id_puntaje"]).execute()
+        supabase.table("stock_sede").update({"cantidad": nuevo_stock}).eq("id_stock", reg_stock["id_stock"]).execute()
+
+        # 5. Cambiar estado de solicitud a Aprobado
+        supabase.table("solicitud_canje").update({"id_estado_canje": id_estado_aprobado}).eq("id_canje", id_canje).execute()
+
+        # 6. Crear Notificación
+        try:
+            now_str = datetime.now().isoformat()
+            supabase.table("notificacion").insert({
+                "mensaje": f"¡Tu solicitud #{id_canje} ha sido APROBADA! Tienes 15 días para retirar tu premio en DAE.",
+                "fecha_envio": now_str,
+                "leido": False,
+                "id_canje": id_canje,
+                "id_tipo_notificacion": 1,
+                "rut_usuario": rut_usuario
+            }).execute()
+        except Exception as e_noti:
+            print(f"[WARN] Error notificando aprobación: {e_noti}")
+
+        return {"message": f"Solicitud #{id_canje} aprobada con éxito. Se descontaron {costo_puntos} pts al alumno."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR APROBAR CANJE]: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al aprobar canje: {str(e)}")
+
+
+@app.put("/premios/marcar-retirado/{id_canje}", tags=["Administración Canjes"])
+def marcar_como_retirado(id_canje: int):
+    """
+    Marca un premio como retirado presencialmente por el estudiante.
+    """
+    try:
+        res_est_retirado = supabase.table("estado_canje").select("id_estado_canje").ilike("descripcion", "%Entregado%").execute()
+        if not res_est_retirado.data:
+            res_est_retirado = supabase.table("estado_canje").select("id_estado_canje").ilike("descripcion", "%Retirado%").execute()
+
+        id_estado_retirado = res_est_retirado.data[0]["id_estado_canje"] if res_est_retirado.data else 3
+
+        supabase.table("solicitud_canje").update({"id_estado_canje": id_estado_retirado}).eq("id_canje", id_canje).execute()
+
+        return {"message": f"Solicitud #{id_canje} marcada como entregada presencialmente."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marcando retiro: {str(e)}")
+
+
+@app.put("/premios/cancelar/{id_canje}", tags=["Administración Canjes"])
+def rechazar_solicitud_canje(id_canje: int):
+    """
+    Rechaza una solicitud de canje. 
+    Como no se habían descontado puntos previamente, NO requiere reembolso en BD.
+    """
+    try:
+        res_sol = supabase.table("solicitud_canje").select("*").eq("id_canje", id_canje).execute()
+        if not res_sol.data:
+            raise HTTPException(status_code=404, detail="Solicitud no encontrada.")
+
+        solicitud = res_sol.data[0]
+        rut_usuario = solicitud["rut_usuario"]
+
+        res_est_rechazado = supabase.table("estado_canje").select("id_estado_canje").ilike("descripcion", "%Rechazado%").execute()
+        if not res_est_rechazado.data:
+            res_est_rechazado = supabase.table("estado_canje").select("id_estado_canje").ilike("descripcion", "%Cancelado%").execute()
+
+        id_estado_rechazado = res_est_rechazado.data[0]["id_estado_canje"] if res_est_rechazado.data else 4
+
+        # Actualizar estado a Rechazado
+        supabase.table("solicitud_canje").update({"id_estado_canje": id_estado_rechazado}).eq("id_canje", id_canje).execute()
+
+        # Notificar al alumno
+        try:
+            now_str = datetime.now().isoformat()
+            supabase.table("notificacion").insert({
+                "mensaje": f"Tu solicitud de canje #{id_canje} ha sido rechazada por la administración.",
+                "fecha_envio": now_str,
+                "leido": False,
+                "id_canje": id_canje,
+                "id_tipo_notificacion": 1,
+                "rut_usuario": rut_usuario
+            }).execute()
+        except Exception as e_noti:
+            print(f"[WARN] Error notificando rechazo: {e_noti}")
+
+        return {"message": f"Solicitud #{id_canje} rechazada exitosamente."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al rechazar solicitud: {str(e)}")
