@@ -3,7 +3,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -15,6 +15,15 @@ from email.message import EmailMessage
 from fastapi.responses import JSONResponse
 load_dotenv()
 
+app = FastAPI(title="API Reportes Operativos")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -242,7 +251,6 @@ class ProcesarSolicitudPayload(BaseModel):
     observacion: Optional[str] = None
 class PremioCreate(BaseModel):
     descripcion: str
-    valor: int = 0
     puntos_requeridos: int
     id_categoria: int
     rut_usuario: str
@@ -254,7 +262,6 @@ class PremioCreate(BaseModel):
 
 class PremioUpdate(BaseModel):
     descripcion: Optional[str] = None
-    valor: Optional[int] = None
     puntos_requeridos: Optional[int] = None
     id_categoria: Optional[int] = None
     rut_usuario: Optional[str] = None
@@ -312,7 +319,8 @@ ESTADO_CANCELADA = 4
 def calcular_estado_dinamico(actividad: dict) -> dict:
     """
     Evalúa la actividad contra el reloj combinando `fecha`, `hora_inicio` y `hora_termino`.
-    Actualiza `id_estado_actividad` y la descripción del dict dinámicamente.
+    Actualiza `id_estado_actividad` y la descripción del dict dinámicamente,
+    pero respeta si una actividad fue iniciada manualmente de forma anticipada.
     """
     if not actividad or actividad.get("id_estado_actividad") == ESTADO_CANCELADA:
         return actividad
@@ -345,21 +353,29 @@ def calcular_estado_dinamico(actividad: dict) -> dict:
         dt_inicio = datetime.combine(f_act, h_ini)
         dt_termino = datetime.combine(f_act, h_ter)
 
-        # Evaluación según la hora actual
-        if dt_inicio <= now < dt_termino:
-            actividad["id_estado_actividad"] = ESTADO_EN_CURSO
-            if isinstance(actividad.get("estado_actividad"), dict):
-                actividad["estado_actividad"]["descripcion"] = "En Curso"
-
-        elif now >= dt_termino:
+        # 1. Si la hora ya pasó la hora de término -> Pasa automáticamente a FINALIZADA
+        if now >= dt_termino:
             actividad["id_estado_actividad"] = ESTADO_FINALIZADA
             if isinstance(actividad.get("estado_actividad"), dict):
                 actividad["estado_actividad"]["descripcion"] = "Finalizada"
 
-        elif now < dt_inicio:
-            actividad["id_estado_actividad"] = ESTADO_PROGRAMADA
+        # 2. Si estamos dentro del rango de horario -> Pasa automáticamente a EN CURSO
+        elif dt_inicio <= now < dt_termino:
+            actividad["id_estado_actividad"] = ESTADO_EN_CURSO
             if isinstance(actividad.get("estado_actividad"), dict):
-                actividad["estado_actividad"]["descripcion"] = "Programada"
+                actividad["estado_actividad"]["descripcion"] = "En Curso"
+
+        # 3. Si aún no llega la hora de inicio (now < dt_inicio):
+        elif now < dt_inicio:
+            # SI FUE INICIADA MANULAMENTE ANTES: Respetamos que ya está EN_CURSO
+            if actividad.get("id_estado_actividad") == ESTADO_EN_CURSO:
+                if isinstance(actividad.get("estado_actividad"), dict):
+                    actividad["estado_actividad"]["descripcion"] = "En Curso"
+            else:
+                # Si no fue iniciada manualmente, se mantiene PROGRAMADA
+                actividad["id_estado_actividad"] = ESTADO_PROGRAMADA
+                if isinstance(actividad.get("estado_actividad"), dict):
+                    actividad["estado_actividad"]["descripcion"] = "Programada"
 
     except Exception as e:
         print(f"Error calculando estado dinámico: {e}")
@@ -952,12 +968,16 @@ def enviar_correo_inscripcion(destinatario: str, nombre_actividad: str, asunto: 
 @app.post("/inscripciones", status_code=status.HTTP_201_CREATED, tags=["Inscripciones"])
 def inscribir_alumno_actividad(datos: InscripcionCreate):
     """
-    Inscribe al alumno en la actividad cumpliendo la estructura exacta de la BD.
+    Inscribe al alumno en la actividad validando:
+    1. Existencia del usuario.
+    2. Matrícula activa (usuario.id_estado_matricula == 1).
+    3. Que no tenga una inscripción previa en esta misma actividad.
+    4. Que no exista traslape de horario con otras actividades inscritas.
     """
     try:
         rut_o_token = datos.rut_alumno.strip()
 
-        # 0. Resolver si es un token de sesión o un RUT directo
+        # 0. Resolver si es token de sesión o RUT directo
         res_sesion = (
             supabase.table("sesion_usuario")
             .select("rut_usuario")
@@ -971,11 +991,11 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
             else rut_o_token
         )
 
-        # 1. Validar existencia del usuario
+        # 1. Validar usuario y su ESTADO DE MATRÍCULA directamente desde tabla 'usuario'
         formatos = generar_formatos_rut(rut_evaluar)
         res_usuario = (
             supabase.table("usuario")
-            .select("rut_usuario", "correo")
+            .select("rut_usuario, correo, id_estado_matricula, estado_matricula(descripcion)")
             .in_("rut_usuario", formatos)
             .execute()
         )
@@ -983,10 +1003,23 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         if not res_usuario.data:
             raise HTTPException(status_code=404, detail="El alumno no se encuentra registrado")
 
-        rut_real = res_usuario.data[0]["rut_usuario"]
-        correo_alumno = res_usuario.data[0].get("correo")
+        usuario = res_usuario.data[0]
+        rut_real = usuario["rut_usuario"]
+        correo_alumno = usuario.get("correo")
 
-        # 2. Validar que no exista inscripción previa
+        # -------------------------------------------------------------------
+        # 1.1 VALIDACIÓN DE MATRÍCULA ACTIVA (id_estado_matricula == 1)
+        # -------------------------------------------------------------------
+        id_est_mat = usuario.get("id_estado_matricula")
+        
+        # Considerando id_estado_matricula = 1 como 'Activo'
+        if id_est_mat != 1:
+            raise HTTPException(
+                status_code=400, 
+                detail="No cuentas con matrícula activa para inscribirte en actividades."
+            )
+
+        # 2. Validar que no exista inscripción previa a ESTA MISMIMA actividad
         check_insc = (
             supabase.table("inscripcion_act")
             .select("id_inscripcion")
@@ -998,10 +1031,10 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         if check_insc.data:
             raise HTTPException(status_code=400, detail="El alumno ya está inscrito en esta actividad")
 
-        # 3. Obtener fecha, hora y NOMBRE de la actividad (SE AGREGA EL SELECT CON NOMBRES O '*')
+        # 3. Obtener datos de la actividad a la que se desea inscribir
         res_act = (
             supabase.table("actividad")
-            .select("*")  # <--- CORRECCIÓN AQUÍ: Se trae todo para asegurar los campos de nombre, fecha y hora
+            .select("*")
             .eq("id_actividad", datos.id_actividad)
             .execute()
         )
@@ -1010,19 +1043,52 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
             raise HTTPException(status_code=404, detail="La actividad no existe")
 
         act_data = res_act.data[0]
-        nombre_act = (
-            act_data.get("nombre_actividad") or 
-            act_data.get("nombre") or 
-            act_data.get("titulo") or 
-            f"Actividad {datos.id_actividad}"
-        )
-        fecha_act = act_data["fecha"]
-        hora_term = act_data["hora_termino"]
+        nombre_act = act_data.get("nombre_actividad", f"Actividad {datos.id_actividad}")
+        fecha_act = str(act_data["fecha"])
+        hora_ini_nueva = str(act_data["hora_inicio"])
+        hora_term_nueva = str(act_data["hora_termino"])
 
-        dt_termino = datetime.fromisoformat(f"{fecha_act}T{hora_term}")
+        # -------------------------------------------------------------------
+        # 3.1 VALIDACIÓN DE TRASLAPE DE HORARIOS
+        # -------------------------------------------------------------------
+        res_mis_inscripciones = (
+            supabase.table("inscripcion_act")
+            .select("""
+                id_actividad,
+                actividad (
+                    id_actividad,
+                    nombre_actividad,
+                    fecha,
+                    hora_inicio,
+                    hora_termino
+                )
+            """)
+            .eq("rut_usuario", rut_real)
+            .execute()
+        )
+
+        if res_mis_inscripciones.data:
+            for item in res_mis_inscripciones.data:
+                act_inscrita = item.get("actividad")
+                if isinstance(act_inscrita, list) and act_inscrita:
+                    act_inscrita = act_inscrita[0]
+                
+                if act_inscrita and str(act_inscrita.get("fecha")) == fecha_act:
+                    h_ini_prev = str(act_inscrita.get("hora_inicio"))
+                    h_term_prev = str(act_inscrita.get("hora_termino"))
+
+                    # Lógica de traslape: (InicioNueva < FinPrevia) Y (FinNueva > InicioPrevia)
+                    if hora_ini_nueva < h_term_prev and hora_term_nueva > h_ini_prev:
+                        nom_conflicto = act_inscrita.get("nombre_actividad", "otra actividad")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Conflicto de horario: Ya estás inscrito en '{nom_conflicto}' el mismo día de {h_ini_prev} a {h_term_prev}. Debes cancelarla previamente."
+                        )
+
+        dt_termino = datetime.fromisoformat(f"{fecha_act}T{hora_term_nueva}")
         now = datetime.now()
 
-        # 4. Insertar la inscripción
+        # 4. Insertar la inscripción en 'inscripcion_act'
         nueva_inscripcion = {
             "rut_usuario": rut_real,
             "id_actividad": datos.id_actividad,
@@ -1033,27 +1099,27 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
 
         res_ins = supabase.table("inscripcion_act").insert(nueva_inscripcion).execute()
 
-        # 5. CREAR NOTIFICACIÓN AUTOMÁTICA (id_tipo_notificacion = 1)
+        # 5. Notificación automática (id_tipo_notificacion = 1)
         try:
             nueva_notificacion = {
                 "rut_usuario": rut_real,
                 "mensaje": f"¡Inscripción exitosa! Te has inscrito correctamente en: {nombre_act}.",
                 "fecha_envio": now.isoformat(),
                 "leido": False,
-                "id_tipo_notificacion": 1  # 1: Inscripción a Actividad
+                "id_tipo_notificacion": 1
             }
             supabase.table("notificacion").insert(nueva_notificacion).execute()
         except Exception as e_noti:
             print(f"[WARN] No se pudo crear la notificación de inscripción: {e_noti}")
 
-        # 5.1 Enviar correo    
+        # 5.1 Enviar correo
         try:
             if correo_alumno:
                 enviar_correo_inscripcion(correo_alumno, nombre_act)
         except Exception as e_email:
             print(f"[WARN] No se pudo enviar el correo de inscripción: {e_email}")
 
-        # 6. Descontar cupo
+        # 6. Descontar cupo en 'cupo_actividad'
         try:
             res_cupo = (
                 supabase.table("cupo_actividad")
@@ -1071,7 +1137,7 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
             print(f"[WARN] No se pudo actualizar el cupo: {e_cupo}")
 
         return {
-            "mensaje": "Inscripción realizada con éxito. Los puntos se abonarán tras confirmar asistencia.",
+            "mensaje": "Inscripción realizada con éxito.",
             "inscripcion": res_ins.data[0] if res_ins.data else nueva_inscripcion
         }
 
@@ -1082,7 +1148,7 @@ def inscribir_alumno_actividad(datos: InscripcionCreate):
         raise HTTPException(
             status_code=500, 
             detail=f"Error en inscripción: {str(e)}"
-        )  
+        ) 
 @app.post("/actividades/{id_actividad}/asistencia", tags=["Asistencia"])
 def registrar_asistencia_actividad(id_actividad: int, datos: CargaAsistenciaBatch):
     """
@@ -2616,3 +2682,358 @@ def obtener_mis_canjes(rut_usuario: str):
         .execute()
         
     return res.data or []
+# --------------------------------------------------------------------
+# ENDPOINTS DE APOYO PARA SELECTS EN EL FRONTEND
+# --------------------------------------------------------------------
+@app.get("/actividades")
+def listar_actividades():
+    res = supabase.table("actividad").select("id_actividad, nombre_actividad, fecha").execute()
+    return res.data or []
+
+@app.get("/sedes")
+def listar_sedes():
+    res = supabase.table("sede").select("id_sede, descripcion").execute()
+    return res.data or []
+
+# --------------------------------------------------------------------
+# 1. REPORTE: DETALLE DE ACTIVIDAD Y ASISTENCIA
+# --------------------------------------------------------------------
+@app.get("/reportes/detalle-actividad/{id_actividad}")
+def obtener_detalle_actividad(id_actividad: int):
+    try:
+        # A. Obtener datos de la actividad
+        act_res = supabase.table("actividad")\
+            .select("id_actividad, nombre_actividad, descripcion, fecha")\
+            .eq("id_actividad", id_actividad)\
+            .execute()
+
+        if not act_res.data:
+            raise HTTPException(status_code=404, detail="Actividad no encontrada")
+
+        actividad = act_res.data[0]
+
+        # B. Obtener todas las inscripciones para esta actividad
+        inscripciones_res = supabase.table("inscripcion_act")\
+            .select("id_inscripcion, puntos_ganados, rut_usuario")\
+            .eq("id_actividad", id_actividad)\
+            .execute()
+
+        inscritos = inscripciones_res.data or []
+
+        # C. Obtener todos los registros de asistencia para esta actividad
+        asistencias_res = supabase.table("asistencia_act")\
+            .select("rut_usuario, presente")\
+            .eq("id_actividad", id_actividad)\
+            .execute()
+
+        # Diccionario para verificar presencia de manera rápida por RUT
+        asistencia_map = {
+            item["rut_usuario"]: item.get("presente", False)
+            for item in (asistencias_res.data or [])
+        }
+
+        # D. Obtener datos de los usuarios inscritos
+        ruts_inscritos = [i["rut_usuario"] for i in inscritos]
+        usuarios_map = {}
+
+        if ruts_inscritos:
+            usuarios_res = supabase.table("usuario")\
+                .select("rut_usuario, nombre_completo, correo")\
+                .in_("rut_usuario", ruts_inscritos)\
+                .execute()
+
+            for usr in (usuarios_res.data or []):
+                usuarios_map[usr["rut_usuario"]] = usr
+
+        # E. Construir respuesta final y calcular métricas
+        total_inscritos = len(inscritos)
+        total_presentes = 0
+        total_puntos_repartidos = 0
+        detalles = []
+
+        for row in inscritos:
+            rut = row["rut_usuario"]
+            usr_info = usuarios_map.get(rut, {})
+
+            # Evaluación explicita de presencia (true/false)
+            es_presente = bool(asistencia_map.get(rut, False))
+
+            if es_presente:
+                total_presentes += 1
+                puntos = row.get("puntos_ganados", 0)
+                total_puntos_repartidos += puntos
+            else:
+                puntos = 0
+
+            detalles.append({
+                "rut": rut,
+                "estudiante": usr_info.get("nombre_completo", "Nombre no registrado"),
+                "correo": usr_info.get("correo", "Sin correo"),
+                "asistencia": "Presente" if es_presente else "Ausente",
+                "puntos": puntos
+            })
+
+        porcentaje_asistencia = round((total_presentes / total_inscritos * 100), 1) if total_inscritos > 0 else 0.0
+
+        return {
+            "kpis": {
+                "nombre_actividad": actividad.get("nombre_actividad"),
+                "fecha": actividad.get("fecha"),
+                "total_inscritos": total_inscritos,
+                "total_presentes": total_presentes,
+                "porcentaje_asistencia": porcentaje_asistencia,
+                "total_puntos_repartidos": total_puntos_repartidos
+            },
+            "detalles": detalles
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en reporte de actividad: {str(e)}")
+
+
+# --------------------------------------------------------------------
+# 2. REPORTE: STOCK DE PREMIOS POR SEDE
+# --------------------------------------------------------------------
+@app.get("/reportes/stock-sede")
+def obtener_stock_sede(
+    id_sede: Optional[int] = Query(None),
+    estado: Optional[str] = Query("TODOS")
+):
+    try:
+        # A. Consulta principal de la tabla stock_sede
+        stock_query = supabase.table("stock_sede").select("id_stock, cantidad, id_premio, id_sede")
+        
+        if id_sede:
+            stock_query = stock_query.eq("id_sede", id_sede)
+
+        stock_res = stock_query.execute()
+        stock_items = stock_res.data or []
+
+        if not stock_items:
+            return {
+                "kpis": {
+                    "total_productos": 0,
+                    "total_unidades_stock": 0,
+                    "alertas_criticas": 0
+                },
+                "detalles": []
+            }
+
+        # B. Obtener IDs únicos de premios, sedes y categorías
+        ids_premios = list(set([item["id_premio"] for item in stock_items if item.get("id_premio")]))
+        ids_sedes = list(set([item["id_sede"] for item in stock_items if item.get("id_sede")]))
+
+        premios_res = supabase.table("premio")\
+            .select("id_premio, descripcion, puntos_requeridos, id_categoria")\
+            .in_("id_premio", ids_premios)\
+            .execute()
+        
+        premios_map = {p["id_premio"]: p for p in (premios_res.data or [])}
+
+        sedes_res = supabase.table("sede")\
+            .select("id_sede, descripcion")\
+            .in_("id_sede", ids_sedes)\
+            .execute()
+            
+        sedes_map = {s["id_sede"]: s["descripcion"] for s in (sedes_res.data or [])}
+
+        ids_categorias = list(set([p["id_categoria"] for p in premios_map.values() if p.get("id_categoria")]))
+        categorias_map = {}
+        
+        if ids_categorias:
+            cat_res = supabase.table("categoria_premio")\
+                .select("id_categoria, descripcion")\
+                .in_("id_categoria", ids_categorias)\
+                .execute()
+            categorias_map = {c["id_categoria"]: c["descripcion"] for c in (cat_res.data or [])}
+
+        # C. Construir consolidado de respuesta
+        detalles = []
+        total_unidades = 0
+        alertas_criticas = 0
+
+        for row in stock_items:
+            stock = row.get("cantidad", 0)
+            premio_info = premios_map.get(row.get("id_premio"), {})
+            sede_nombre = sedes_map.get(row.get("id_sede"), "Sede Desconocida")
+            categoria_nombre = categorias_map.get(premio_info.get("id_categoria"), "General")
+
+            total_unidades += stock
+
+            if stock == 0:
+                estado_stock = "Agotado"
+            elif stock <= 5:
+                estado_stock = "Stock Crítico"
+            else:
+                estado_stock = "Suficiente"
+
+            if stock <= 5:
+                alertas_criticas += 1
+
+            # Filtros de estado opcionales
+            if estado == "CRITICO" and stock > 5:
+                continue
+            if estado == "AGOTADO" and stock > 0:
+                continue
+
+            detalles.append({
+                "premio": premio_info.get("descripcion", "Sin nombre"),
+                "categoria": categoria_nombre,
+                "sede": sede_nombre,
+                "costo_puntos": premio_info.get("puntos_requeridos", 0),
+                "stock_actual": stock,
+                "estado_stock": estado_stock
+            })
+
+        return {
+            "kpis": {
+                "total_productos": len(detalles),
+                "total_unidades_stock": total_unidades,
+                "alertas_criticas": alertas_criticas
+            },
+            "detalles": detalles
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en reporte de stock: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+@app.post("/solicitud-canje/cancelar")
+def cancelar_solicitud_canje(payload: dict):
+    rut_alumno = payload.get("rut_alumno")
+    id_premio = payload.get("id_premio")
+    
+    # Actualizar estado_canje a 4 (Cancelado) para la solicitud en curso (estado 1)
+    res = supabase.table("solicitud_canje") \
+        .update({"id_estado_canje": 4}) \
+        .eq("rut_usuario", rut_alumno) \
+        .eq("id_premio", id_premio) \
+        .eq("id_estado_canje", 1) \
+        .execute()
+        
+    return {"mensaje": "Solicitud cancelada correctamente"}
+
+# =====================================================================
+# INICIAR ACTIVIDAD (Cambia estado a EN CURSO = 2)
+# =====================================================================
+@app.put("/actividades/{id_actividad}/iniciar", tags=["Actividades"])
+def iniciar_actividad(id_actividad: int):
+    try:
+        # Verificar existencia
+        check = supabase.table("actividad").select("id_actividad, id_estado_actividad").eq("id_actividad", id_actividad).execute()
+        if not check.data:
+            raise HTTPException(status_code=404, detail="Actividad no encontrada")
+
+        # Cambiar estado a EN_CURSO (2)
+        supabase.table("actividad").update({"id_estado_actividad": 2}).eq("id_actividad", id_actividad).execute()
+
+        # Retornar actividad actualizada con relaciones
+        res = supabase.table("actividad").select(QUERY_RELACIONES_ACTIVIDAD).eq("id_actividad", id_actividad).execute()
+        return calcular_estado_dinamico(res.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+# TERMINAR ACTIVIDAD (Cambia estado a FINALIZADA = 3 y Liquida Puntos)
+# =====================================================================
+@app.put("/actividades/{id_actividad}/terminar", tags=["Actividades"])
+def terminar_actividad(id_actividad: int):
+    try:
+        check = supabase.table("actividad").select("id_actividad").eq("id_actividad", id_actividad).execute()
+        if not check.data:
+            raise HTTPException(status_code=404, detail="Actividad no encontrada")
+
+        # 1. Cambiar estado a FINALIZADA (3)
+        supabase.table("actividad").update({"id_estado_actividad": 3}).eq("id_actividad", id_actividad).execute()
+
+        # 2. Obtener los puntos asignados a la actividad
+        p_res = supabase.table("puntaje_act").select("cantidad").eq("id_actividad", id_actividad).execute()
+        puntos_otorgados = p_res.data[0]["cantidad"] if p_res.data else 5
+
+        # 3. Obtener alumnos que marcaron asistencia
+        asist_res = supabase.table("asistencia_act").select("rut_usuario").eq("id_actividad", id_actividad).execute()
+        
+        # 4. Asignar los puntos_ganados en inscripcion_act a los asistentes
+        if asist_res.data:
+            for asist in asist_res.data:
+                supabase.table("inscripcion_act").update({
+                    "puntos_ganados": puntos_otorgados
+                }).eq("id_actividad", id_actividad).eq("rut_usuario", asist["rut_usuario"]).execute()
+
+        # Retornar actividad actualizada
+        res = supabase.table("actividad").select(QUERY_RELACIONES_ACTIVIDAD).eq("id_actividad", id_actividad).execute()
+        return calcular_estado_dinamico(res.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+# REPROGRAMAR ACTIVIDAD (Solo si está vencida/sin inscritos)
+# =====================================================================
+class ActividadReprogramar(BaseModel):
+    fecha: date
+    hora_inicio: time
+    hora_termino: time
+
+# =====================================================================
+# REPROGRAMAR ACTIVIDAD (Solo si venció/finalizó SIN inscritos ni puntos otorgados)
+# =====================================================================
+@app.put("/actividades/{id_actividad}/reprogramar", tags=["Actividades"])
+def reprogramar_actividad(id_actividad: int, payload: ActividadReprogramar):
+    try:
+        # 1. Verificar existencia de la actividad
+        check = supabase.table("actividad").select("id_actividad, fecha, hora_termino, id_estado_actividad").eq("id_actividad", id_actividad).execute()
+        if not check.data:
+            raise HTTPException(status_code=404, detail="Actividad no encontrada")
+
+        # 2. VALIDACIÓN ESTRICTA: Verificar si la actividad tuvo inscritos
+        insc_res = supabase.table("inscripcion_act").select("id_inscripcion").eq("id_actividad", id_actividad).execute()
+        if insc_res.data and len(insc_res.data) > 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="No se puede reprogramar: esta actividad ya cuenta con alumnos inscritos o participantes que ganaron puntos. Debe crear una nueva actividad."
+            )
+
+        # 3. Validar coherencia de horario
+        if payload.hora_termino <= payload.hora_inicio:
+            raise HTTPException(status_code=400, detail="La hora de término debe ser posterior a la hora de inicio.")
+
+        fecha_str = payload.fecha.isoformat()
+        hora_ini_str = payload.hora_inicio.isoformat()
+        hora_ter_str = payload.hora_termino.isoformat()
+
+        # 4. Actualizar fecha/hora y restablecer estado a PROGRAMADA (1)
+        supabase.table("actividad").update({
+            "fecha": fecha_str,
+            "hora_inicio": hora_ini_str,
+            "hora_termino": hora_ter_str,
+            "id_estado_actividad": 1
+        }).eq("id_actividad", id_actividad).execute()
+
+        # 5. Sincronizar en calendario
+        supabase.table("calendario").update({
+            "fecha": fecha_str,
+            "hora": hora_ini_str
+        }).eq("id_actividad", id_actividad).execute()
+
+        # Retornar actividad actualizada con relaciones
+        res = supabase.table("actividad").select(QUERY_RELACIONES_ACTIVIDAD).eq("id_actividad", id_actividad).execute()
+        return calcular_estado_dinamico(res.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
