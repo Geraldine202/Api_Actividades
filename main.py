@@ -1089,15 +1089,17 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
     """
     Consolida de manera permanente el total de puntos acumulados por un usuario:
     1. Suma los puntos por asistencias como participante (presente = True).
-    2. Suma los puntos por actividades creadas que hayan finalizado y tenido asistentes,
-       sin importar si el usuario es o dejó de ser Consejero de Carrera.
+    2. Suma los puntos por actividades creadas (base + 5 de bonificación) ÚNICAMENTE
+       si el usuario es Consejero de Carrera (id_tipo_usuario == 4).
     3. Resta los canjes aprobados/entregados.
     4. Actualiza 'historial_puntos' y 'puntaje_total'.
+    5. Envía correos/notificaciones: con puntos para Consejero, e informativos sin puntos 
+       para Docente/Admin.
     """
     try:
         now_str = datetime.now().isoformat()
 
-        # 1. Resolver RUT y Datos del Usuario
+        # 1. Resolver RUT y Datos del Usuario (incluyendo id_tipo_usuario)
         res_sesion = (
             supabase.table("sesion_usuario")
             .select("rut_usuario")
@@ -1107,9 +1109,15 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
         rut_real = res_sesion.data[0]["rut_usuario"] if res_sesion.data else rut_usuario_param
         formatos = generar_formatos_rut(rut_real)
 
-        res_usr = supabase.table("usuario").select("rut_usuario, correo, id_tipo_usuario").in_("rut_usuario", formatos).execute()
+        res_usr = (
+            supabase.table("usuario")
+            .select("rut_usuario, correo, id_tipo_usuario")
+            .in_("rut_usuario", formatos)
+            .execute()
+        )
         usr_data = res_usr.data[0] if res_usr.data else {}
         correo_usuario = usr_data.get("correo") or usr_data.get("email")
+        id_tipo_usuario = usr_data.get("id_tipo_usuario")
 
         # 2. PUNTOS COMO PARTICIPANTE: Consultar asistencias confirmadas
         res_asistencia = (
@@ -1161,11 +1169,10 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
 
             puntos_asistencia = sum(puntos_por_actividad.values())
 
-        # 3. PUNTOS COMO ORGANIZADOR/CREADOR:
-        # Se consultan TODAS las actividades creadas por el RUT que estén finalizadas (id_estado_actividad = 3),
-        # sin importar si su rol actual es Alumno o Consejero.
+        # 3. PUNTOS Y ACTIVIDADES COMO ORGANIZADOR / CREADOR
         puntos_creador = 0
         actividades_creador_map = {}
+        ids_validas_creador = []
 
         try:
             res_act_creadas = (
@@ -1190,8 +1197,7 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
                     ids_creadas_raw.append(id_actividad_forzada)
                     res_act_creadas.data.append(check_pertenencia.data[0])
 
-            # Validar que hayan asistido alumnos a la actividad creada
-            ids_validas = []
+            # Verificar si asistieron alumnos a la actividad creada
             if ids_creadas_raw:
                 res_asist_val = (
                     supabase.table("asistencia_act")
@@ -1200,29 +1206,33 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
                     .eq("presente", True)
                     .execute()
                 )
-                ids_validas = list(set([a["id_actividad"] for a in (res_asist_val.data or [])]))
+                ids_validas_creador = list(set([a["id_actividad"] for a in (res_asist_val.data or [])]))
 
-            if ids_validas:
-                res_pts_cons = (
-                    supabase.table("puntaje_act")
-                    .select("id_actividad, cantidad")
-                    .in_("id_actividad", ids_validas)
-                    .execute()
-                )
-                
-                for p in (res_pts_cons.data or []):
-                    id_act_c = p.get("id_actividad")
-                    base_pts = int(p.get("cantidad") or 0)
-                    actividades_creador_map[id_act_c] = base_pts + 5
-
-                puntos_creador = sum(actividades_creador_map.values())
-                
+            if ids_validas_creador:
                 for act_c in (res_act_creadas.data or []):
-                    if act_c["id_actividad"] in ids_validas:
-                        mapa_nombres_actividades[act_c["id_actividad"]] = act_c.get("nombre_actividad") or f"la actividad #{act_c['id_actividad']}"
+                    if act_c["id_actividad"] in ids_validas_creador:
+                        mapa_nombres_actividades[act_c["id_actividad"]] = (
+                            act_c.get("nombre_actividad") or f"la actividad #{act_c['id_actividad']}"
+                        )
+
+                # Si es Consejero (id_tipo_usuario == 4), acumula puntos + bonificación de 5 pts
+                if id_tipo_usuario == 4:
+                    res_pts_cons = (
+                        supabase.table("puntaje_act")
+                        .select("id_actividad, cantidad")
+                        .in_("id_actividad", ids_validas_creador)
+                        .execute()
+                    )
+                    
+                    for p in (res_pts_cons.data or []):
+                        id_act_c = p.get("id_actividad")
+                        base_pts = int(p.get("cantidad") or 0)
+                        actividades_creador_map[id_act_c] = base_pts + 5
+
+                    puntos_creador = sum(actividades_creador_map.values())
 
         except Exception as e_cons:
-            print(f"[WARN] Error calculando puntos de creador para {rut_real}: {e_cons}")
+            print(f"[WARN] Error procesando actividades creadas para {rut_real}: {e_cons}")
 
         # 4. RESTAR CANJES REALIZADOS
         total_canjeado = 0
@@ -1293,7 +1303,7 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
             res_notis_previas = supabase.table("notificacion").select("mensaje").in_("rut_usuario", formatos).execute()
             mensajes_existentes = [n.get("mensaje", "") for n in (res_notis_previas.data or [])]
 
-            # A) Notificaciones Asistencias
+            # A) Notificaciones de Asistencia (Para todos los participantes)
             for id_act, pts in puntos_por_actividad.items():
                 nom_act = mapa_nombres_actividades.get(id_act, f"la actividad #{id_act}")
                 tag = f"[ACT-{id_act}]"
@@ -1316,28 +1326,51 @@ def actualizar_puntaje_total_alumno(rut_usuario_param: str, id_actividad_forzada
                             mensaje_cuerpo=f"¡Felicitaciones! Se ha confirmado tu asistencia a la actividad <b>{nom_act}</b>.<br><br>🎉 <b>Puntos ganados:</b> +{pts} pts<br>🏆 <b>Puntaje Total:</b> {total_acumulado} pts"
                         )
 
-            # B) Notificaciones Creador
-            for id_act, pts_total_cons in actividades_creador_map.items():
+            # B) Notificaciones para Creadores/Organizadores de la Actividad
+            for id_act in ids_validas_creador:
                 nom_act = mapa_nombres_actividades.get(id_act, f"la actividad #{id_act}")
-                tag_cons = f"[CONS-ACT-{id_act}]"
-                msg_cons = f"¡Felicitaciones! Se ha finalizado la actividad '{nom_act}' {tag_cons}. Has recibido +{pts_total_cons} puntos (+5 de bonificación). Tu saldo total es {total_acumulado} pts."
+                tag_creador = f"[CREADOR-ACT-{id_act}]"
 
-                if not any(tag_cons in m for m in mensajes_existentes):
-                    supabase.table("notificacion").insert({
-                        "rut_usuario": rut_real,
-                        "mensaje": msg_cons,
-                        "fecha_envio": now_str,
-                        "leido": False,
-                        "id_tipo_notificacion": 2
-                    }).execute()
+                if not any(tag_creador in m for m in mensajes_existentes):
+                    if id_tipo_usuario == 4:
+                        # --- CONSEJERO DE CARRERA: Notificación y correo con bonificación ---
+                        pts_total_cons = actividades_creador_map.get(id_act, 5)
+                        msg_cons = f"¡Felicitaciones! Se ha finalizado la actividad '{nom_act}' {tag_creador}. Has recibido +{pts_total_cons} puntos (+5 de bonificación). Tu saldo total es {total_acumulado} pts."
 
-                    if correo_usuario:
-                        enviar_correo_inscripcion(
-                            destinatario=correo_usuario,
-                            nombre_actividad=nom_act,
-                            asunto=f"¡Puntos Acreditados como Organizador! - {nom_act}",
-                            mensaje_cuerpo=f"¡Hola!<br><br>La actividad que organizaste <b>{nom_act}</b> ha finalizado con la asistencia de alumnos.<br><br>🎉 <b>Puntos acreditados:</b> +{pts_total_cons} pts (incluye +5 pts de bonificación)<br>🏆 <b>Puntaje Total:</b> {total_acumulado} pts"
-                        )
+                        supabase.table("notificacion").insert({
+                            "rut_usuario": rut_real,
+                            "mensaje": msg_cons,
+                            "fecha_envio": now_str,
+                            "leido": False,
+                            "id_tipo_notificacion": 2
+                        }).execute()
+
+                        if correo_usuario:
+                            enviar_correo_inscripcion(
+                                destinatario=correo_usuario,
+                                nombre_actividad=nom_act,
+                                asunto=f"¡Puntos Acreditados como Organizador! - {nom_act}",
+                                mensaje_cuerpo=f"¡Hola!<br><br>La actividad que organizaste <b>{nom_act}</b> ha finalizado con la asistencia confirmada de alumnos.<br><br>🎉 <b>Puntos acreditados:</b> +{pts_total_cons} pts (incluye +5 pts de bonificación)<br>🏆 <b>Puntaje Total:</b> {total_acumulado} pts"
+                            )
+                    else:
+                        # --- DOCENTE / ADMINISTRADOR: Correo y notificación institucional de cierre ---
+                        msg_docente = f"La actividad '{nom_act}' {tag_creador} ha finalizado y cerrado su registro de asistencia correctamente."
+
+                        supabase.table("notificacion").insert({
+                            "rut_usuario": rut_real,
+                            "mensaje": msg_docente,
+                            "fecha_envio": now_str,
+                            "leido": False,
+                            "id_tipo_notificacion": 1
+                        }).execute()
+
+                        if correo_usuario:
+                            enviar_correo_inscripcion(
+                                destinatario=correo_usuario,
+                                nombre_actividad=nom_act,
+                                asunto=f"Cierre de Actividad Concluido - {nom_act}",
+                                mensaje_cuerpo=f"Estimado/a,<br><br>Le informamos que la actividad <b>{nom_act}</b> ha sido finalizada con éxito en la plataforma.<br><br>✅ La nómina de asistencia de los alumnos ha sido procesada y registrada en el sistema."
+                            )
 
         except Exception as e_noti:
             print(f"[WARN] Error enviando notificaciones: {e_noti}")
