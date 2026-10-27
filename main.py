@@ -2430,7 +2430,10 @@ def obtener_solicitudes_canje():
 @app.get("/premios/solicitudes/responsable/{rut_responsable}", tags=["Administración Canjes"])
 def obtener_solicitudes_canje_por_responsable(rut_responsable: str):
     try:
-        # 1. Consultar en Supabase filtrando por el rut_usuario responsable en la tabla premio
+        # Sanitizar el RUT recibido para crear variaciones posibles (con o sin formato)
+        rut_limpio = "".join(filter(str.isalnum, rut_responsable)).upper()
+        
+        # 1. Consultar solicitudes trayendo la relación con premio y usuario
         res = (
             supabase.table("solicitud_canje")
             .select("""
@@ -2484,21 +2487,28 @@ def obtener_solicitudes_canje_por_responsable(rut_responsable: str):
                     retirado
                 )
             """)
-            .eq("premio.rut_usuario", rut_responsable) # Filtro a nivel de Supabase/PostgreSQL
             .order("fecha_solicitud", desc=True)
             .limit(100)
             .execute()
         )
 
-        canjes = res.data or []
+        canjes_raw = res.data or []
+
+        # 2. Filtrar en Python asegurando que el RUT del premio coincida sin importar puntos ni guiones
+        canjes = []
+        for item in canjes_raw:
+            premio_obj = item.get("premio") or {}
+            rut_premio = premio_obj.get("rut_usuario") or ""
+            rut_premio_limpio = "".join(filter(str.isalnum, str(rut_premio))).upper()
+
+            if rut_premio_limpio == rut_limpio:
+                canjes.append(item)
 
         if not canjes:
             return []
 
-        # 2. Extraer los RUTs únicos de los estudiantes que solicitaron
+        # 3. Obtener niveles de forma masiva para los canjes filtrados
         ruts_unicos = list({item.get("rut_usuario") for item in canjes if item.get("rut_usuario")})
-
-        # 3. Obtener niveles de forma masiva
         niveles_map = obtener_niveles_masivo(ruts_unicos)
 
         nivel_default = {
@@ -2521,6 +2531,7 @@ def obtener_solicitudes_canje_por_responsable(rut_responsable: str):
             detail=f"Error al obtener las solicitudes a cargo del responsable: {str(e)}"
         )
 
+    
 # 3. Rutas dinámicas con parámetros al final
 @app.get("/premios/{id_premio}", tags=["Premios"])
 def obtener_premio_por_id(id_premio: int):
